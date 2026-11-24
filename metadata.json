@@ -1,0 +1,6 @@
+{
+  "name": "CohortTrack — B2025-2029 Internship Tracker",
+  "description": "Live interactive student attendance and cohort tracking dashboard for Fullstack Internship B2025-2029 - II Year (24.11.2026 - 12.12.2026).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
