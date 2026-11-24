@@ -219,14 +219,22 @@ export default function App() {
           fetch('/api/auth/status'),
           fetch('/api/state'),
         ]);
-        if (!cancelled && authRes.ok) {
+        const isJson = (res: Response) =>
+          (res.headers.get('content-type') || '').includes('application/json');
+
+        if (!cancelled && (!authRes.ok || !isJson(authRes) || !stateRes.ok || !isJson(stateRes))) {
+          showNotice(
+            'Backend /api service is unavailable. Ensure /api serverless routes are deployed.'
+          );
+          return;
+        }
+
+        if (!cancelled) {
           const authData = await authRes.json();
           setSuperAdminClaimed(Boolean(authData.superAdminClaimed));
           if (Array.isArray(authData.facultyDirectory)) {
             setFacultyDirectory(authData.facultyDirectory);
           }
-        }
-        if (!cancelled && stateRes.ok) {
           const stateData = await stateRes.json();
           applyServerCohortPayload(stateData);
         }
