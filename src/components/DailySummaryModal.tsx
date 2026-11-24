@@ -1,6 +1,12 @@
-import React, { useEffect, useMemo } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Download, ExternalLink, FileText, X } from 'lucide-react';
-import { AttendanceStatus, BatchRecord, StudentRecord } from '../types/internship';
+import {
+  AttendanceStatus,
+  BatchRecord,
+  SessionPeriod,
+  StudentRecord,
+} from '../types/internship';
+import { compareLex } from '../utils/csvParser';
 import { downloadDailyAttendancePdf } from '../utils/pdfReport';
 
 interface DailySummaryModalProps {
@@ -9,11 +15,13 @@ interface DailySummaryModalProps {
   programTitle: string;
   dayLabel: string;
   dateKey: string;
+  initialSession: SessionPeriod;
   batches: BatchRecord[];
   students: StudentRecord[];
-  dayAttendance: Record<string, AttendanceStatus>;
+  fnAttendance: Record<string, AttendanceStatus>;
+  anAttendance: Record<string, AttendanceStatus>;
   onExportCsv: () => void;
-  onSelectBatch: (batchId: string) => void;
+  onSelectBatch: (batchId: string, session: SessionPeriod) => void;
 }
 
 interface BatchBreakdownRow {
@@ -25,6 +33,8 @@ interface BatchBreakdownRow {
   unmarked: number;
   attended: number;
   rate: number;
+  fnRate: number;
+  anRate: number;
 }
 
 export const DailySummaryModal: React.FC<DailySummaryModalProps> = ({
@@ -33,12 +43,20 @@ export const DailySummaryModal: React.FC<DailySummaryModalProps> = ({
   programTitle,
   dayLabel,
   dateKey,
+  initialSession,
   batches,
   students,
-  dayAttendance,
+  fnAttendance,
+  anAttendance,
   onExportCsv,
   onSelectBatch,
 }) => {
+  const [modalSession, setModalSession] = useState<SessionPeriod>(initialSession);
+
+  useEffect(() => {
+    setModalSession(initialSession);
+  }, [initialSession, isOpen]);
+
   useEffect(() => {
     if (!isOpen) return;
     const handleKey = (e: KeyboardEvent) => {
@@ -58,6 +76,9 @@ export const DailySummaryModal: React.FC<DailySummaryModalProps> = ({
     return map;
   }, [students]);
 
+  const activeAttendanceMap =
+    modalSession === 'FN' ? fnAttendance : anAttendance;
+
   const { rows, totals } = useMemo(() => {
     let totalEnrolled = 0;
     let totalPresent = 0;
@@ -65,28 +86,49 @@ export const DailySummaryModal: React.FC<DailySummaryModalProps> = ({
     let totalOd = 0;
     let totalAbsent = 0;
     let totalUnmarked = 0;
+    let totalFnAttended = 0;
+    let totalAnAttended = 0;
 
-    const batchRows: BatchBreakdownRow[] = batches.map((batch) => {
+    const sortedBatches = [...batches].sort((a, b) =>
+      compareLex(a.department, b.department)
+    );
+
+    const batchRows: BatchBreakdownRow[] = sortedBatches.map((batch) => {
       const list = studentsByBatch.get(batch.id) || [];
       let present = 0;
       let late = 0;
       let od = 0;
       let absent = 0;
       let unmarked = 0;
+      let fnAtt = 0;
+      let anAtt = 0;
 
       list.forEach((s) => {
-        const st = dayAttendance[s.id] || 'unmarked';
+        const st = activeAttendanceMap[s.id] || 'unmarked';
         if (st === 'present') present++;
         else if (st === 'late') late++;
         else if (st === 'od') od++;
         else if (st === 'absent') absent++;
         else unmarked++;
+
+        const fnSt = fnAttendance[s.id] || 'unmarked';
+        const anSt = anAttendance[s.id] || 'unmarked';
+        if (fnSt === 'present' || fnSt === 'late' || fnSt === 'od') fnAtt++;
+        if (anSt === 'present' || anSt === 'late' || anSt === 'od') anAtt++;
       });
 
       const attended = present + late + od;
       const rate =
         batch.studentCount > 0
           ? Math.round((attended / batch.studentCount) * 1000) / 10
+          : 0;
+      const fnRate =
+        batch.studentCount > 0
+          ? Math.round((fnAtt / batch.studentCount) * 1000) / 10
+          : 0;
+      const anRate =
+        batch.studentCount > 0
+          ? Math.round((anAtt / batch.studentCount) * 1000) / 10
           : 0;
 
       if (batch.trackType === 'IT') {
@@ -96,6 +138,8 @@ export const DailySummaryModal: React.FC<DailySummaryModalProps> = ({
         totalOd += od;
         totalAbsent += absent;
         totalUnmarked += unmarked;
+        totalFnAttended += fnAtt;
+        totalAnAttended += anAtt;
       }
 
       return {
@@ -107,6 +151,8 @@ export const DailySummaryModal: React.FC<DailySummaryModalProps> = ({
         unmarked,
         attended,
         rate,
+        fnRate,
+        anRate,
       };
     });
 
@@ -114,6 +160,14 @@ export const DailySummaryModal: React.FC<DailySummaryModalProps> = ({
     const overallRate =
       totalEnrolled > 0
         ? Math.round((totalAttended / totalEnrolled) * 1000) / 10
+        : 0;
+    const overallFnRate =
+      totalEnrolled > 0
+        ? Math.round((totalFnAttended / totalEnrolled) * 1000) / 10
+        : 0;
+    const overallAnRate =
+      totalEnrolled > 0
+        ? Math.round((totalAnAttended / totalEnrolled) * 1000) / 10
         : 0;
 
     return {
@@ -127,9 +181,11 @@ export const DailySummaryModal: React.FC<DailySummaryModalProps> = ({
         unmarked: totalUnmarked,
         attended: totalAttended,
         rate: overallRate,
+        fnRate: overallFnRate,
+        anRate: overallAnRate,
       },
     };
-  }, [batches, studentsByBatch, dayAttendance]);
+  }, [batches, studentsByBatch, activeAttendanceMap, fnAttendance, anAttendance]);
 
   if (!isOpen) return null;
 
@@ -157,13 +213,39 @@ export const DailySummaryModal: React.FC<DailySummaryModalProps> = ({
               <span className="font-mono tabular-nums">
                 {dayLabel} ({dateKey})
               </span>
+              <span aria-hidden="true">·</span>
+              <span className="font-mono tabular-nums">
+                FN {totals.fnRate.toFixed(1)}% / AN {totals.anRate.toFixed(1)}%
+              </span>
             </div>
             <h2 className="text-xl font-semibold text-slate-900 dark:text-white tracking-tight mt-0.5">
-              Daily Attendance Summary
+              Daily Attendance Summary ({modalSession === 'FN' ? 'Forenoon · FN' : 'Afternoon · AN'})
             </h2>
           </div>
 
           <div className="flex flex-wrap items-center gap-2 shrink-0">
+            {/* FN / AN Toggle */}
+            <div
+              className="inline-flex items-center p-1 bg-slate-100 dark:bg-slate-800 rounded-lg"
+              role="group"
+              aria-label="Session period"
+            >
+              {(['FN', 'AN'] as SessionPeriod[]).map((sess) => (
+                <button
+                  key={sess}
+                  type="button"
+                  onClick={() => setModalSession(sess)}
+                  className={`px-2.5 py-1 text-xs font-mono font-semibold rounded-md transition-colors whitespace-nowrap ${
+                    modalSession === sess
+                      ? 'bg-white dark:bg-[#111827] text-slate-900 dark:text-white shadow-xs'
+                      : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                  }`}
+                >
+                  {sess}
+                </button>
+              ))}
+            </div>
+
             <button
               type="button"
               onClick={() =>
@@ -171,6 +253,7 @@ export const DailySummaryModal: React.FC<DailySummaryModalProps> = ({
                   programTitle,
                   dayLabel,
                   dateKey,
+                  session: modalSession,
                   rows,
                   totals,
                 })
@@ -186,7 +269,7 @@ export const DailySummaryModal: React.FC<DailySummaryModalProps> = ({
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors whitespace-nowrap"
             >
               <Download className="w-3.5 h-3.5" />
-              Export Summary CSV
+              Export CSV
             </button>
             <button
               type="button"
@@ -210,13 +293,13 @@ export const DailySummaryModal: React.FC<DailySummaryModalProps> = ({
                 {totals.enrolled}
               </div>
               <div className="mt-0.5 text-[11px] font-mono tabular-nums text-slate-500 dark:text-slate-400">
-                {totals.rate}% attended
+                {modalSession}: {totals.rate}% attended
               </div>
             </div>
 
             <div className="p-3.5 rounded-lg bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800">
               <div className="text-[11px] font-medium text-emerald-700 dark:text-emerald-400">
-                Present
+                Present ({modalSession})
               </div>
               <div className="mt-1 text-2xl font-bold font-mono tabular-nums text-emerald-700 dark:text-emerald-400">
                 {totals.present}
@@ -228,7 +311,7 @@ export const DailySummaryModal: React.FC<DailySummaryModalProps> = ({
 
             <div className="p-3.5 rounded-lg bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800">
               <div className="text-[11px] font-medium text-amber-700 dark:text-amber-400">
-                Late
+                Late ({modalSession})
               </div>
               <div className="mt-1 text-2xl font-bold font-mono tabular-nums text-amber-700 dark:text-amber-400">
                 {totals.late}
@@ -240,7 +323,7 @@ export const DailySummaryModal: React.FC<DailySummaryModalProps> = ({
 
             <div className="p-3.5 rounded-lg bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800">
               <div className="text-[11px] font-medium text-blue-700 dark:text-blue-400">
-                On-Duty (OD)
+                On-Duty ({modalSession})
               </div>
               <div className="mt-1 text-2xl font-bold font-mono tabular-nums text-blue-700 dark:text-blue-400">
                 {totals.od}
@@ -252,7 +335,7 @@ export const DailySummaryModal: React.FC<DailySummaryModalProps> = ({
 
             <div className="p-3.5 rounded-lg bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800">
               <div className="text-[11px] font-medium text-rose-700 dark:text-rose-400">
-                Absent
+                Absent ({modalSession})
               </div>
               <div className="mt-1 text-2xl font-bold font-mono tabular-nums text-rose-700 dark:text-rose-400">
                 {totals.absent}
@@ -264,7 +347,7 @@ export const DailySummaryModal: React.FC<DailySummaryModalProps> = ({
 
             <div className="p-3.5 rounded-lg bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800">
               <div className="text-[11px] font-medium text-slate-500 dark:text-slate-400">
-                Unmarked
+                Unmarked ({modalSession})
               </div>
               <div className="mt-1 text-2xl font-bold font-mono tabular-nums text-slate-700 dark:text-slate-200">
                 {totals.unmarked}
@@ -326,8 +409,8 @@ export const DailySummaryModal: React.FC<DailySummaryModalProps> = ({
                 <th className="py-3 px-3 text-right text-rose-700 dark:text-rose-400">
                   Absent
                 </th>
-                <th className="py-3 px-3 text-right">Unmarked</th>
-                <th className="py-3 px-4 text-right">Attended %</th>
+                <th className="py-3 px-3 text-right">FN %</th>
+                <th className="py-3 px-3 text-right">AN %</th>
                 <th className="py-3 px-4 text-right">Roll Call</th>
               </tr>
             </thead>
@@ -360,16 +443,16 @@ export const DailySummaryModal: React.FC<DailySummaryModalProps> = ({
                     <td className="py-2.5 px-3 text-right font-mono tabular-nums text-rose-700 dark:text-rose-400">
                       {isCore ? '—' : row.absent}
                     </td>
-                    <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-500 dark:text-slate-400">
-                      {isCore ? '—' : row.unmarked}
+                    <td className="py-2.5 px-3 text-right font-mono tabular-nums font-semibold text-slate-800 dark:text-slate-200">
+                      {isCore ? '—' : `${row.fnRate.toFixed(1)}%`}
                     </td>
-                    <td className="py-2.5 px-4 text-right font-mono tabular-nums font-semibold text-slate-900 dark:text-white">
-                      {isCore ? '—' : `${row.rate.toFixed(1)}%`}
+                    <td className="py-2.5 px-3 text-right font-mono tabular-nums font-semibold text-slate-800 dark:text-slate-200">
+                      {isCore ? '—' : `${row.anRate.toFixed(1)}%`}
                     </td>
                     <td className="py-2.5 px-4 text-right whitespace-nowrap">
                       <button
                         type="button"
-                        onClick={() => onSelectBatch(row.batch.id)}
+                        onClick={() => onSelectBatch(row.batch.id, modalSession)}
                         className="inline-flex items-center gap-1 text-blue-600 dark:text-blue-400 hover:underline font-medium"
                       >
                         {isCore ? 'Details' : 'Inspect'}
@@ -386,7 +469,7 @@ export const DailySummaryModal: React.FC<DailySummaryModalProps> = ({
                   Total IT Cohort ({batches.filter((b) => b.trackType === 'IT').length} Batches)
                 </td>
                 <td className="py-3 px-4 text-slate-500 dark:text-slate-400">
-                  All Partners
+                  {modalSession} Breakdown
                 </td>
                 <td className="py-3 px-3 text-right font-mono tabular-nums text-slate-900 dark:text-white">
                   {totals.enrolled}
@@ -403,11 +486,11 @@ export const DailySummaryModal: React.FC<DailySummaryModalProps> = ({
                 <td className="py-3 px-3 text-right font-mono tabular-nums text-rose-700 dark:text-rose-400">
                   {totals.absent}
                 </td>
-                <td className="py-3 px-3 text-right font-mono tabular-nums text-slate-600 dark:text-slate-300">
-                  {totals.unmarked}
+                <td className="py-3 px-3 text-right font-mono tabular-nums text-slate-900 dark:text-white">
+                  {totals.fnRate.toFixed(1)}%
                 </td>
-                <td className="py-3 px-4 text-right font-mono tabular-nums text-slate-900 dark:text-white">
-                  {totals.rate.toFixed(1)}%
+                <td className="py-3 px-3 text-right font-mono tabular-nums text-slate-900 dark:text-white">
+                  {totals.anRate.toFixed(1)}%
                 </td>
                 <td className="py-3 px-4" />
               </tr>

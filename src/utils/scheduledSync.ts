@@ -1,9 +1,10 @@
-import {
+import type {
   AttendanceStatus,
   BatchRecord,
   BatchSessionMeta,
+  SessionPeriod,
   StudentRecord,
-} from '../types/internship';
+} from '../types/internship.ts';
 
 export type CheckpointId = 'morning' | 'afternoon' | 'evening';
 
@@ -11,6 +12,7 @@ export interface DailyCheckpoint {
   id: CheckpointId;
   label: string;
   timeLabel: string;
+  session: SessionPeriod;
   hour: number;
   minute: number;
   description: string;
@@ -21,25 +23,28 @@ export const DAILY_CHECKPOINTS: DailyCheckpoint[] = [
     id: 'morning',
     label: 'Morning',
     timeLabel: '10:00 AM',
+    session: 'FN',
     hour: 10,
     minute: 0,
-    description: 'Morning roll-call capture',
+    description: 'FN (Forenoon) roll-call capture',
   },
   {
     id: 'afternoon',
     label: 'Afternoon',
     timeLabel: '01:00 PM',
+    session: 'AN',
     hour: 13,
     minute: 0,
-    description: 'Post-lunch verification pass',
+    description: 'AN (Afternoon) verification pass',
   },
   {
     id: 'evening',
     label: 'Evening',
     timeLabel: '03:00 PM',
+    session: 'AN',
     hour: 15,
     minute: 0,
-    description: 'Final closing attendance lock',
+    description: 'AN closing attendance lock',
   },
 ];
 

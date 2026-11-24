@@ -11,14 +11,17 @@ import {
   UserCheck,
 } from 'lucide-react';
 import { BatchRecord } from '../types/internship';
+import { compareLex } from '../utils/csvParser';
 
 interface DirectoryViewProps {
   batches: BatchRecord[];
+  canEditAllocations: boolean;
   onEditBatchAllocation: (batchId: string) => void;
 }
 
 export const DirectoryView: React.FC<DirectoryViewProps> = ({
   batches,
+  canEditAllocations,
   onEditBatchAllocation,
 }) => {
   const [search, setSearch] = useState('');
@@ -26,29 +29,33 @@ export const DirectoryView: React.FC<DirectoryViewProps> = ({
 
   const pendingAllocations = useMemo(
     () =>
-      batches.filter(
-        (b) =>
-          b.trackType === 'CORE' ||
-          !b.venue ||
-          !b.expertName ||
-          b.organisation === 'Unassigned'
-      ),
+      batches
+        .filter(
+          (b) =>
+            b.trackType === 'CORE' ||
+            !b.venue ||
+            !b.expertName ||
+            b.organisation === 'Unassigned'
+        )
+        .sort((a, b) => compareLex(a.department, b.department)),
     [batches]
   );
 
   const assignedBatches = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return batches.filter((b) => {
-      if (!q) return true;
-      return (
-        b.department.toLowerCase().includes(q) ||
-        b.organisation.toLowerCase().includes(q) ||
-        b.expertName.toLowerCase().includes(q) ||
-        b.venue.toLowerCase().includes(q) ||
-        b.roomNumber.toLowerCase().includes(q) ||
-        b.facultyIncharge.some((f) => f.toLowerCase().includes(q))
-      );
-    });
+    return batches
+      .filter((b) => {
+        if (!q) return true;
+        return (
+          b.department.toLowerCase().includes(q) ||
+          b.organisation.toLowerCase().includes(q) ||
+          b.expertName.toLowerCase().includes(q) ||
+          b.venue.toLowerCase().includes(q) ||
+          b.roomNumber.toLowerCase().includes(q) ||
+          b.facultyIncharge.some((f) => f.toLowerCase().includes(q))
+        );
+      })
+      .sort((a, b) => compareLex(a.department, b.department));
   }, [batches, search]);
 
   const handleCopy = (val: string) => {
@@ -95,14 +102,16 @@ export const DirectoryView: React.FC<DirectoryViewProps> = ({
                     {b.allocationNote || 'Missing venue / trainer details'}
                   </p>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => onEditBatchAllocation(b.id)}
-                  className="inline-flex items-center justify-center gap-1.5 w-full px-3 py-1.5 text-xs font-medium rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
-                >
-                  <Pencil className="w-3 h-3" />
-                  Assign Allocation
-                </button>
+                {canEditAllocations && (
+                  <button
+                    type="button"
+                    onClick={() => onEditBatchAllocation(b.id)}
+                    className="inline-flex items-center justify-center gap-1.5 w-full px-3 py-1.5 text-xs font-medium rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+                  >
+                    <Pencil className="w-3 h-3" />
+                    Assign Allocation
+                  </button>
+                )}
               </div>
             ))}
           </div>
@@ -154,15 +163,17 @@ export const DirectoryView: React.FC<DirectoryViewProps> = ({
                     {b.department}
                   </h3>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => onEditBatchAllocation(b.id)}
-                  className="p-1.5 rounded-md text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
-                  title="Edit allocation"
-                  aria-label={`Edit ${b.department} allocation`}
-                >
-                  <Pencil className="w-3.5 h-3.5" />
-                </button>
+                {canEditAllocations && (
+                  <button
+                    type="button"
+                    onClick={() => onEditBatchAllocation(b.id)}
+                    className="p-1.5 rounded-md text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+                    title="Edit allocation"
+                    aria-label={`Edit ${b.department} allocation`}
+                  >
+                    <Pencil className="w-3.5 h-3.5" />
+                  </button>
+                )}
               </div>
 
               <div className="mt-4 pt-3 border-t border-slate-100 dark:border-slate-800/80 space-y-2 text-xs">

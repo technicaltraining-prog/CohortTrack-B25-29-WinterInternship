@@ -8,6 +8,9 @@ import {
   Clock,
   Download,
   LayoutDashboard,
+  Lock,
+  LogIn,
+  LogOut,
   Menu,
   Minus,
   Moon,
@@ -16,55 +19,48 @@ import {
   Plus,
   RotateCcw,
   Search,
+  ShieldCheck,
   Sun,
   Upload,
   Users,
   X,
 } from 'lucide-react';
+import { AccessControlView } from './components/AccessControlView';
 import { AttendanceCharts } from './components/AttendanceCharts';
+import { AuthModal, type PublicFacultyEntry } from './components/AuthModal';
 import { BatchDetailDrawer } from './components/BatchDetailDrawer';
 import { DailySummaryModal } from './components/DailySummaryModal';
 import { DirectoryView } from './components/DirectoryView';
 import { ScheduleHeatmapView } from './components/ScheduleHeatmapView';
 import { StudentRosterView } from './components/StudentRosterView';
-import {
+import type {
   AttendanceStatus,
+  AuthUser,
   BatchRecord,
   BatchSessionMeta,
   BatchSessionStatus,
   DashboardView,
+  SessionPeriod,
   StudentRecord,
 } from './types/internship';
 import {
   buildBatchSummaryCsv,
   buildStudentRollCallCsv,
-  FALLBACK_CSV_TEXT,
-  generateInitialAttendanceState,
+  compareLex,
+  deduplicateAndSortStudents,
   generateInternshipDays,
   generateStudentsForBatches,
-  parseInternshipCsv,
-  SOURCE_CSV_URL,
+  makeSessionKey,
 } from './utils/csvParser';
 import {
-  computeCheckpointAttendanceUpdate,
   DAILY_CHECKPOINTS,
-  DailyCheckpoint,
+  type DailyCheckpoint,
   getNextCheckpointInfo,
   getReachedCheckpointsForDate,
-  ScheduleSyncState,
+  type ScheduleSyncState,
 } from './utils/scheduledSync';
 
-const STORAGE_KEY = 'cohorttrack_b2025_state_v1';
 const THEME_STORAGE_KEY = 'cohorttrack_theme_v1';
-const SCHEDULE_STORAGE_KEY = 'cohorttrack_schedule_v1';
-
-interface PersistedState {
-  programTitle: string;
-  dateRange: string;
-  batches: BatchRecord[];
-  dailyAttendance: Record<string, Record<string, AttendanceStatus>>;
-  sessionMeta: Record<string, Record<string, BatchSessionMeta>>;
-}
 
 type SortKey = 'department' | 'enrolled' | 'attendance' | 'room';
 
@@ -99,13 +95,22 @@ export default function App() {
     }
   }, [theme]);
 
-  // Core data state
+  // Auth state strictly held in React memory (never persisted to localStorage)
+  const [authToken, setAuthToken] = useState<string | null>(null);
+  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
+  const [superAdminClaimed, setSuperAdminClaimed] = useState(true);
+  const [facultyDirectory, setFacultyDirectory] = useState<PublicFacultyEntry[]>([]);
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
+  const [actionFeedback, setActionFeedback] = useState<string | null>(null);
+
+  // Core data state loaded from backend API
   const [loading, setLoading] = useState(true);
   const [programTitle, setProgramTitle] = useState(
     'Fullstack Internship B2025-2029 - II Year'
   );
   const [dateRange, setDateRange] = useState('24.11.2026 - 12.12.2026');
   const [batches, setBatches] = useState<BatchRecord[]>([]);
+  const [serverStudents, setServerStudents] = useState<StudentRecord[]>([]);
   const [dailyAttendance, setDailyAttendance] = useState<
     Record<string, Record<string, AttendanceStatus>>
   >({});
@@ -118,6 +123,7 @@ export default function App() {
   const [selectedDateKey, setSelectedDateKey] = useState<string>(
     workingDays[0]?.dateKey || '2026-11-24'
   );
+  const [activeSession, setActiveSession] = useState<SessionPeriod>('FN');
   const [drawerBatchId, setDrawerBatchId] = useState<string | null>(null);
   const [drawerInitialTab, setDrawerInitialTab] = useState<'rollcall' | 'allocation'>(
     'rollcall'
@@ -132,134 +138,177 @@ export default function App() {
   const [sortKey, setSortKey] = useState<SortKey>('department');
   const [sortAsc, setSortAsc] = useState(true);
 
-  // Optional user-controlled live roll-call check-in simulation
+  // Optional user-controlled live roll-call check-in simulation (Admin / Super Admin / Faculty own batch)
   const [isLiveSimulating, setIsLiveSimulating] = useState(false);
   const [lastLiveEvent, setLastLiveEvent] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Daily 3-slot scheduled auto-update state (10:00 AM, 01:00 PM, 03:00 PM)
+  // Daily 3-slot auto-update schedule state
   const [clockNow, setClockNow] = useState<Date>(() => new Date());
-  const [scheduleState, setScheduleState] = useState<ScheduleSyncState>(() => {
-    try {
-      const raw = localStorage.getItem(SCHEDULE_STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw) as ScheduleSyncState;
-        if (typeof parsed?.enabled === 'boolean') {
-          return {
-            enabled: parsed.enabled,
-            lastSyncSummary: parsed.lastSyncSummary || null,
-            completedSlots: parsed.completedSlots || {},
-          };
-        }
-      }
-    } catch {
-      // ignore storage errors
-    }
-    return {
-      enabled: true,
-      lastSyncSummary: null,
-      completedSlots: {},
-    };
+  const [scheduleState, setScheduleState] = useState<ScheduleSyncState>({
+    enabled: true,
+    lastSyncSummary: null,
+    completedSlots: {},
   });
 
-  const students: StudentRecord[] = useMemo(
-    () => generateStudentsForBatches(batches),
-    [batches]
-  );
+  const isAdminOrSuper =
+    currentUser?.role === 'admin' || currentUser?.role === 'superadmin';
+  const isAuthenticatedEditor = Boolean(authToken && currentUser && currentUser.role !== 'guest');
 
-  const initializeFromCsvText = useCallback(
-    (csvText: string) => {
-      const parsed = parseInternshipCsv(csvText);
-      const genStudents = generateStudentsForBatches(parsed.batches);
-      const initial = generateInitialAttendanceState(
-        parsed.batches,
-        genStudents,
-        days
-      );
-      setProgramTitle(parsed.programTitle);
-      setDateRange(parsed.dateRange);
-      setBatches(parsed.batches);
-      setDailyAttendance(initial.dailyAttendance);
-      setSessionMeta(initial.sessionMeta);
-      setSelectedDateKey(workingDays[0]?.dateKey || '2026-11-24');
+  const canMarkDepartment = useCallback(
+    (department: string) => {
+      if (!authToken || !currentUser || currentUser.role === 'guest') return false;
+      if (currentUser.role === 'superadmin' || currentUser.role === 'admin') {
+        return true;
+      }
+      return currentUser.assignedDepartments.includes(department);
     },
-    [days, workingDays]
+    [authToken, currentUser]
   );
 
-  // Initial load from localStorage or attached CSV file
+  const showNotice = useCallback((msg: string) => {
+    setActionFeedback(msg);
+    window.setTimeout(() => {
+      setActionFeedback((curr) => (curr === msg ? null : curr));
+    }, 3500);
+  }, []);
+
+  const students: StudentRecord[] = useMemo(
+    () =>
+      serverStudents.length > 0
+        ? deduplicateAndSortStudents(serverStudents)
+        : generateStudentsForBatches(batches),
+    [serverStudents, batches]
+  );
+
+  const applyServerCohortPayload = useCallback(
+    (data: {
+      programTitle?: string;
+      dateRange?: string;
+      batches?: BatchRecord[];
+      students?: StudentRecord[];
+      dailyAttendance?: Record<string, Record<string, AttendanceStatus>>;
+      sessionMeta?: Record<string, Record<string, BatchSessionMeta>>;
+      scheduleState?: ScheduleSyncState;
+      facultyDirectory?: PublicFacultyEntry[];
+    }) => {
+      if (data.programTitle) setProgramTitle(data.programTitle);
+      if (data.dateRange) setDateRange(data.dateRange);
+      if (Array.isArray(data.batches)) setBatches(data.batches);
+      if (Array.isArray(data.students)) {
+        setServerStudents(deduplicateAndSortStudents(data.students));
+      } else if (Array.isArray(data.batches)) {
+        setServerStudents([]);
+      }
+      if (data.dailyAttendance) setDailyAttendance(data.dailyAttendance);
+      if (data.sessionMeta) setSessionMeta(data.sessionMeta);
+      if (data.scheduleState) setScheduleState(data.scheduleState);
+      if (Array.isArray(data.facultyDirectory)) {
+        setFacultyDirectory(data.facultyDirectory);
+      }
+    },
+    []
+  );
+
+  // Initial load from Express backend API
   useEffect(() => {
     let cancelled = false;
     async function boot() {
       try {
-        const rawSaved = localStorage.getItem(STORAGE_KEY);
-        if (rawSaved) {
-          const parsedSaved = JSON.parse(rawSaved) as PersistedState;
-          if (parsedSaved?.batches?.length > 0) {
-            if (!cancelled) {
-              setProgramTitle(parsedSaved.programTitle);
-              setDateRange(parsedSaved.dateRange);
-              setBatches(parsedSaved.batches);
-              setDailyAttendance(parsedSaved.dailyAttendance || {});
-              setSessionMeta(parsedSaved.sessionMeta || {});
-              setLoading(false);
-            }
-            return;
+        const [authRes, stateRes] = await Promise.all([
+          fetch('/api/auth/status'),
+          fetch('/api/state'),
+        ]);
+        if (!cancelled && authRes.ok) {
+          const authData = await authRes.json();
+          setSuperAdminClaimed(Boolean(authData.superAdminClaimed));
+          if (Array.isArray(authData.facultyDirectory)) {
+            setFacultyDirectory(authData.facultyDirectory);
           }
         }
-      } catch {
-        // Fallback to CSV fetch
-      }
-
-      try {
-        const res = await fetch(SOURCE_CSV_URL);
-        const text = res.ok ? await res.text() : FALLBACK_CSV_TEXT;
-        if (!cancelled) {
-          initializeFromCsvText(text);
-          setLoading(false);
+        if (!cancelled && stateRes.ok) {
+          const stateData = await stateRes.json();
+          applyServerCohortPayload(stateData);
         }
       } catch {
-        if (!cancelled) {
-          initializeFromCsvText(FALLBACK_CSV_TEXT);
-          setLoading(false);
-        }
+        showNotice('Unable to reach server state endpoint.');
+      } finally {
+        if (!cancelled) setLoading(false);
       }
     }
     boot();
     return () => {
       cancelled = true;
     };
-  }, [initializeFromCsvText]);
+  }, [applyServerCohortPayload, showNotice]);
 
-  // Persist changes to localStorage
+  // Redirect away from Access view if signed out or non-admin
   useEffect(() => {
-    if (loading || batches.length === 0) return;
-    try {
-      const payload: PersistedState = {
-        programTitle,
-        dateRange,
-        batches,
-        dailyAttendance,
-        sessionMeta,
-      };
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
-    } catch {
-      // ignore storage quota errors
+    if (activeView === 'access' && !isAdminOrSuper) {
+      setActiveView('overview');
     }
-  }, [loading, programTitle, dateRange, batches, dailyAttendance, sessionMeta]);
+  }, [activeView, isAdminOrSuper]);
+
+  const handleAuthenticated = useCallback((token: string, user: AuthUser) => {
+    setAuthToken(token);
+    setCurrentUser(user);
+    setSuperAdminClaimed(true);
+    setActionFeedback(null);
+  }, []);
+
+  const handleLogout = useCallback(async () => {
+    setIsLiveSimulating(false);
+    setLastLiveEvent(null);
+    const tok = authToken;
+    setAuthToken(null);
+    setCurrentUser(null);
+    if (activeView === 'access') {
+      setActiveView('overview');
+    }
+    if (tok) {
+      try {
+        await fetch('/api/auth/logout', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${tok}` },
+        });
+      } catch {
+        // ignore network errors on logout
+      }
+    }
+  }, [authToken, activeView]);
 
   const currentDay = useMemo(
     () => workingDays.find((d) => d.dateKey === selectedDateKey) || workingDays[0],
     [workingDays, selectedDateKey]
   );
 
-  const dayAttendance = useMemo(
-    () => dailyAttendance[selectedDateKey] || {},
-    [dailyAttendance, selectedDateKey]
+  const fnSessionKey = useMemo(
+    () => makeSessionKey(selectedDateKey, 'FN'),
+    [selectedDateKey]
+  );
+  const anSessionKey = useMemo(
+    () => makeSessionKey(selectedDateKey, 'AN'),
+    [selectedDateKey]
+  );
+  const activeSessionKey =
+    activeSession === 'FN' ? fnSessionKey : anSessionKey;
+
+  const fnAttendance = useMemo(
+    () => dailyAttendance[fnSessionKey] || {},
+    [dailyAttendance, fnSessionKey]
+  );
+  const anAttendance = useMemo(
+    () => dailyAttendance[anSessionKey] || {},
+    [dailyAttendance, anSessionKey]
   );
 
+  const dayAttendance = activeSession === 'FN' ? fnAttendance : anAttendance;
+  const pairedDayAttendance =
+    activeSession === 'FN' ? anAttendance : fnAttendance;
+
   const daySessionMeta = useMemo(
-    () => sessionMeta[selectedDateKey] || {},
-    [sessionMeta, selectedDateKey]
+    () => sessionMeta[activeSessionKey] || {},
+    [sessionMeta, activeSessionKey]
   );
 
   const studentsByBatch = useMemo(() => {
@@ -272,89 +321,120 @@ export default function App() {
     return map;
   }, [students]);
 
-  const formatTimeNow = () => {
-    const now = new Date();
-    return now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  };
-
-  // Update a single student's attendance
-  const handleSetStudentStatus = useCallback(
-    (studentId: string, status: AttendanceStatus) => {
-      const student = students.find((s) => s.id === studentId);
-      setDailyAttendance((prev) => ({
-        ...prev,
-        [selectedDateKey]: {
-          ...(prev[selectedDateKey] || {}),
-          [studentId]: status,
-        },
-      }));
-      if (student) {
-        setSessionMeta((prev) => {
-          const dayMeta = prev[selectedDateKey] || {};
-          const existing = dayMeta[student.batchId];
-          if (existing?.status === 'pending' || !existing) {
-            return {
-              ...prev,
-              [selectedDateKey]: {
-                ...dayMeta,
-                [student.batchId]: {
-                  status: 'in-session',
-                  updatedAt: formatTimeNow(),
-                },
-              },
-            };
-          }
-          return {
-            ...prev,
-            [selectedDateKey]: {
-              ...dayMeta,
-              [student.batchId]: {
-                ...existing,
-                updatedAt: formatTimeNow(),
-              },
-            },
-          };
-        });
-      }
-    },
-    [selectedDateKey, students]
+  const batchById = useMemo(
+    () => new Map(batches.map((b) => [b.id, b])),
+    [batches]
   );
 
-  // Bulk update a batch's students
-  const handleBulkSetBatchStatus = useCallback(
-    (batchId: string, status: AttendanceStatus, onlyUnmarked = false) => {
-      const list = studentsByBatch.get(batchId) || [];
-      setDailyAttendance((prev) => {
-        const nextDay = { ...(prev[selectedDateKey] || {}) };
-        list.forEach((s) => {
-          if (!onlyUnmarked || !nextDay[s.id] || nextDay[s.id] === 'unmarked') {
-            nextDay[s.id] = status;
-          }
-        });
-        return { ...prev, [selectedDateKey]: nextDay };
-      });
-      setSessionMeta((prev) => ({
-        ...prev,
-        [selectedDateKey]: {
-          ...(prev[selectedDateKey] || {}),
-          [batchId]: {
-            status: status === 'unmarked' ? 'pending' : 'completed',
-            updatedAt: status === 'unmarked' ? 'Awaiting roll call' : formatTimeNow(),
+  // Update a single student's attendance via authenticated API
+  const handleSetStudentSessionStatus = useCallback(
+    async (studentId: string, session: SessionPeriod, status: AttendanceStatus) => {
+      if (!authToken || !currentUser || currentUser.role === 'guest') {
+        setIsAuthModalOpen(true);
+        return;
+      }
+      const student = students.find((s) => s.id === studentId);
+      if (!student || !canMarkDepartment(student.department)) {
+        showNotice(`Only ${student?.department || 'assigned'} Faculty or Admin can mark this batch.`);
+        return;
+      }
+
+      try {
+        const res = await fetch('/api/attendance/mark', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${authToken}`,
           },
-        },
-      }));
+          body: JSON.stringify({
+            dateKey: selectedDateKey,
+            session,
+            studentId,
+            status,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          showNotice(data.error || 'Failed to update attendance.');
+          return;
+        }
+        setDailyAttendance((prev) => ({
+          ...prev,
+          [data.sessKey]: data.dayAttendance,
+        }));
+        setSessionMeta((prev) => ({
+          ...prev,
+          [data.sessKey]: data.dayMeta,
+        }));
+      } catch {
+        showNotice('Network error while saving attendance.');
+      }
     },
-    [selectedDateKey, studentsByBatch]
+    [authToken, currentUser, students, canMarkDepartment, selectedDateKey, showNotice]
+  );
+
+  const handleSetStudentStatus = useCallback(
+    (studentId: string, status: AttendanceStatus) => {
+      void handleSetStudentSessionStatus(studentId, activeSession, status);
+    },
+    [handleSetStudentSessionStatus, activeSession]
+  );
+
+  // Bulk update a batch's students in the active FN/AN session
+  const handleBulkSetBatchStatus = useCallback(
+    async (batchId: string, status: AttendanceStatus, onlyUnmarked = false) => {
+      if (!authToken || !currentUser || currentUser.role === 'guest') {
+        setIsAuthModalOpen(true);
+        return;
+      }
+      const batch = batchById.get(batchId);
+      if (!batch || !canMarkDepartment(batch.department)) {
+        showNotice(`Not authorized to bulk update ${batch?.department || 'this batch'}.`);
+        return;
+      }
+
+      try {
+        const res = await fetch('/api/attendance/bulk', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${authToken}`,
+          },
+          body: JSON.stringify({
+            dateKey: selectedDateKey,
+            session: activeSession,
+            batchId,
+            status,
+            onlyUnmarked,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          showNotice(data.error || 'Bulk update failed.');
+          return;
+        }
+        setDailyAttendance((prev) => ({
+          ...prev,
+          [data.sessKey]: data.dayAttendance,
+        }));
+        setSessionMeta((prev) => ({
+          ...prev,
+          [data.sessKey]: data.dayMeta,
+        }));
+      } catch {
+        showNotice('Network error during bulk update.');
+      }
+    },
+    [authToken, currentUser, batchById, canMarkDepartment, selectedDateKey, activeSession, showNotice]
   );
 
   // Quick +/- 1 present student adjustment right from the main batch table
   const handleQuickAdjustPresent = useCallback(
     (batchId: string, delta: 1 | -1) => {
       const list = studentsByBatch.get(batchId) || [];
-      const currentMap = dailyAttendance[selectedDateKey] || {};
+      const currentMap = dailyAttendance[activeSessionKey] || {};
 
       if (delta === 1) {
-        // Find first unmarked or absent student and mark present
         const target =
           list.find((s) => !currentMap[s.id] || currentMap[s.id] === 'unmarked') ||
           list.find((s) => currentMap[s.id] === 'absent') ||
@@ -363,7 +443,6 @@ export default function App() {
           handleSetStudentStatus(target.id, 'present');
         }
       } else {
-        // Find last present student and mark absent
         const reversed = [...list].reverse();
         const target = reversed.find((s) => currentMap[s.id] === 'present');
         if (target) {
@@ -371,35 +450,96 @@ export default function App() {
         }
       }
     },
-    [dailyAttendance, handleSetStudentStatus, selectedDateKey, studentsByBatch]
+    [dailyAttendance, activeSessionKey, handleSetStudentStatus, studentsByBatch]
   );
 
   const handleSetSessionStatus = useCallback(
-    (batchId: string, status: BatchSessionStatus) => {
-      setSessionMeta((prev) => ({
-        ...prev,
-        [selectedDateKey]: {
-          ...(prev[selectedDateKey] || {}),
-          [batchId]: {
-            status,
-            updatedAt: status === 'pending' ? 'Awaiting roll call' : formatTimeNow(),
+    async (batchId: string, status: BatchSessionStatus) => {
+      if (!authToken || !currentUser || currentUser.role === 'guest') {
+        setIsAuthModalOpen(true);
+        return;
+      }
+      const batch = batchById.get(batchId);
+      if (!batch || !canMarkDepartment(batch.department)) {
+        showNotice(`Not authorized to change status for ${batch?.department || 'this batch'}.`);
+        return;
+      }
+      try {
+        const res = await fetch('/api/attendance/session-status', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${authToken}`,
           },
-        },
-      }));
+          body: JSON.stringify({
+            dateKey: selectedDateKey,
+            session: activeSession,
+            batchId,
+            status,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          showNotice(data.error || 'Failed to update session status.');
+          return;
+        }
+        setSessionMeta((prev) => ({
+          ...prev,
+          [data.sessKey]: data.dayMeta,
+        }));
+      } catch {
+        showNotice('Network error updating session status.');
+      }
     },
-    [selectedDateKey]
+    [authToken, currentUser, batchById, canMarkDepartment, selectedDateKey, activeSession, showNotice]
   );
 
-  const handleUpdateBatch = useCallback((updated: BatchRecord) => {
-    setBatches((prev) => prev.map((b) => (b.id === updated.id ? updated : b)));
-  }, []);
+  const handleUpdateBatch = useCallback(
+    async (updated: BatchRecord) => {
+      if (!authToken || !isAdminOrSuper) {
+        setIsAuthModalOpen(true);
+        return;
+      }
+      try {
+        const res = await fetch(`/api/batches/${encodeURIComponent(updated.id)}`, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${authToken}`,
+          },
+          body: JSON.stringify(updated),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          showNotice(data.error || 'Failed to save batch allocation.');
+          return;
+        }
+        setBatches((prev) =>
+          prev.map((b) => (b.id === updated.id ? data.batch : b))
+        );
+        if (Array.isArray(data.facultyDirectory)) {
+          setFacultyDirectory(data.facultyDirectory);
+        }
+      } catch {
+        showNotice('Network error saving batch allocation.');
+      }
+    },
+    [authToken, isAdminOrSuper, showNotice]
+  );
 
-  // Optional live check-in simulator
+  // Optional live check-in simulator scoped to permitted batches
   useEffect(() => {
-    if (!isLiveSimulating) return;
+    if (!isLiveSimulating || !authToken || !currentUser || currentUser.role === 'guest') {
+      return;
+    }
     const timer = window.setInterval(() => {
-      const currentMap = dailyAttendance[selectedDateKey] || {};
-      const unmarkedStudents = students.filter(
+      const permittedStudents = students.filter((s) =>
+        canMarkDepartment(s.department)
+      );
+      if (permittedStudents.length === 0) return;
+
+      const currentMap = dailyAttendance[activeSessionKey] || {};
+      const unmarkedStudents = permittedStudents.filter(
         (s) => !currentMap[s.id] || currentMap[s.id] === 'unmarked'
       );
 
@@ -411,93 +551,109 @@ export default function App() {
           roll < 0.88 ? 'present' : roll < 0.95 ? 'late' : 'absent';
         handleSetStudentStatus(pick.id, status);
         setLastLiveEvent(
-          `${pick.rollNumber} (${pick.department}) marked ${status}`
+          `${pick.rollNumber} (${pick.department} · ${activeSession}) marked ${status}`
         );
       } else {
-        // Cycle a random student between present and late/od if everyone is marked
-        const itStudents = students;
-        if (itStudents.length === 0) return;
-        const pick = itStudents[Math.floor(Math.random() * itStudents.length)];
+        const pick =
+          permittedStudents[Math.floor(Math.random() * permittedStudents.length)];
         const nextStatus: AttendanceStatus =
           currentMap[pick.id] === 'present' ? 'late' : 'present';
         handleSetStudentStatus(pick.id, nextStatus);
         setLastLiveEvent(
-          `${pick.rollNumber} (${pick.department}) updated to ${nextStatus}`
+          `${pick.rollNumber} (${pick.department} · ${activeSession}) updated to ${nextStatus}`
         );
       }
-    }, 1800);
+    }, 2000);
 
     return () => window.clearInterval(timer);
   }, [
     isLiveSimulating,
+    authToken,
+    currentUser,
     dailyAttendance,
-    selectedDateKey,
+    activeSessionKey,
+    activeSession,
     students,
+    canMarkDepartment,
     handleSetStudentStatus,
   ]);
 
-  // Persist scheduled sync state
-  useEffect(() => {
-    try {
-      localStorage.setItem(SCHEDULE_STORAGE_KEY, JSON.stringify(scheduleState));
-    } catch {
-      // ignore
-    }
-  }, [scheduleState]);
-
   const handleRunCheckpoint = useCallback(
-    (checkpoint: DailyCheckpoint, targetDateKey = selectedDateKey) => {
-      if (batches.length === 0 || students.length === 0) return;
-
-      const currentDayAtt = dailyAttendance[targetDateKey] || {};
-      const currentDayMeta = sessionMeta[targetDateKey] || {};
-
-      const { nextDayAttendance, nextDayMeta, updatedStudentsCount } =
-        computeCheckpointAttendanceUpdate({
-          checkpoint,
-          dateKey: targetDateKey,
-          batches,
-          students,
-          currentDayAttendance: currentDayAtt,
-          currentDayMeta,
-        });
-
-      setDailyAttendance((prev) => ({
-        ...prev,
-        [targetDateKey]: nextDayAttendance,
-      }));
-      setSessionMeta((prev) => ({
-        ...prev,
-        [targetDateKey]: nextDayMeta,
-      }));
-
-      const stamp = new Date().toLocaleTimeString([], {
-        hour: '2-digit',
-        minute: '2-digit',
-      });
-
-      setScheduleState((prev) => ({
-        ...prev,
-        lastSyncSummary: `${checkpoint.label} (${checkpoint.timeLabel}) ran at ${stamp} · ${updatedStudentsCount} records synced`,
-        completedSlots: {
-          ...prev.completedSlots,
-          [targetDateKey]: {
-            ...(prev.completedSlots[targetDateKey] || {}),
-            [checkpoint.id]: stamp,
+    async (checkpoint: DailyCheckpoint, targetDateKey = selectedDateKey) => {
+      if (!authToken || !currentUser || currentUser.role === 'guest') {
+        setIsAuthModalOpen(true);
+        return;
+      }
+      try {
+        const res = await fetch('/api/attendance/checkpoint', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${authToken}`,
           },
-        },
-      }));
+          body: JSON.stringify({
+            checkpointId: checkpoint.id,
+            dateKey: targetDateKey,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          showNotice(data.error || 'Scheduled sync failed.');
+          return;
+        }
+        setDailyAttendance((prev) => ({
+          ...prev,
+          [data.sessKey]: data.dayAttendance,
+        }));
+        setSessionMeta((prev) => ({
+          ...prev,
+          [data.sessKey]: data.dayMeta,
+        }));
+        if (data.scheduleState) {
+          setScheduleState(data.scheduleState);
+        }
+      } catch {
+        showNotice('Network error running scheduled sync.');
+      }
     },
-    [batches, students, dailyAttendance, sessionMeta, selectedDateKey]
+    [authToken, currentUser, selectedDateKey, showNotice]
   );
 
-  // Clock watcher for automatic 10:00 AM, 01:00 PM, and 03:00 PM daily updates
+  const handleToggleSchedule = useCallback(async () => {
+    if (!authToken || !isAdminOrSuper) {
+      setIsAuthModalOpen(true);
+      return;
+    }
+    try {
+      const res = await fetch('/api/schedule', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({ enabled: !scheduleState.enabled }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        showNotice(data.error || 'Unable to update schedule state.');
+        return;
+      }
+      setScheduleState(data.scheduleState);
+    } catch {
+      showNotice('Network error toggling schedule.');
+    }
+  }, [authToken, isAdminOrSuper, scheduleState.enabled, showNotice]);
+
+  // Clock watcher for automatic 10:00 AM (FN), 01:00 PM (AN), and 03:00 PM (AN) daily updates
   useEffect(() => {
     const checkSchedule = () => {
       const now = new Date();
       setClockNow(now);
 
-      if (!scheduleState.enabled || loading || batches.length === 0) return;
+      // Only Admin or Super Admin clients automatically push global 3-slot checkpoints
+      if (!scheduleState.enabled || loading || batches.length === 0 || !isAdminOrSuper || !authToken) {
+        return;
+      }
 
       const yyyy = now.getFullYear();
       const mm = String(now.getMonth() + 1).padStart(2, '0');
@@ -513,9 +669,8 @@ export default function App() {
       const due = reached.filter((cp) => !completedToday[cp.id]);
 
       if (due.length > 0) {
-        // Execute the latest due checkpoint for today
         const latestDue = due[due.length - 1];
-        handleRunCheckpoint(latestDue, todayKey);
+        void handleRunCheckpoint(latestDue, todayKey);
       }
     };
 
@@ -528,6 +683,8 @@ export default function App() {
     loading,
     batches.length,
     workingDays,
+    isAdminOrSuper,
+    authToken,
     handleRunCheckpoint,
   ]);
 
@@ -541,48 +698,31 @@ export default function App() {
     [scheduleState.completedSlots, selectedDateKey]
   );
 
-  // Populate Week 1 realistic logs on demand in Schedule Heatmap view
-  const handlePopulateWeekPreview = useCallback(() => {
-    const firstFive = workingDays.slice(0, 5);
-    setDailyAttendance((prev) => {
-      const next = { ...prev };
-      firstFive.forEach((day, dIdx) => {
-        if (next[day.dateKey] && Object.keys(next[day.dateKey]).length > 0) {
-          return;
-        }
-        const dayMap: Record<string, AttendanceStatus> = {};
-        students.forEach((s, sIdx) => {
-          const v = (sIdx * 17 + dIdx * 31 + s.rollNumber.charCodeAt(4)) % 100;
-          if (v < 5 + dIdx) dayMap[s.id] = 'absent';
-          else if (v < 8 + dIdx) dayMap[s.id] = 'late';
-          else if (v === 11) dayMap[s.id] = 'od';
-          else dayMap[s.id] = 'present';
-        });
-        next[day.dateKey] = dayMap;
+  // Populate Week 1 realistic FN & AN logs on demand (Admin / Super Admin)
+  const handlePopulateWeekPreview = useCallback(async () => {
+    if (!authToken || !isAdminOrSuper) {
+      setIsAuthModalOpen(true);
+      return;
+    }
+    try {
+      const res = await fetch('/api/schedule/populate-week', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${authToken}` },
       });
-      return next;
-    });
-    setSessionMeta((prev) => {
-      const next = { ...prev };
-      firstFive.forEach((day) => {
-        const metaMap: Record<string, BatchSessionMeta> = {
-          ...(next[day.dateKey] || {}),
-        };
-        batches.forEach((b) => {
-          if (!metaMap[b.id]) {
-            metaMap[b.id] = {
-              status: b.trackType === 'CORE' ? 'core' : 'completed',
-              updatedAt: '09:30 AM',
-            };
-          }
-        });
-        next[day.dateKey] = metaMap;
-      });
-      return next;
-    });
-  }, [batches, students, workingDays]);
+      const data = await res.json();
+      if (!res.ok) {
+        showNotice(data.error || 'Failed to populate Week 1 logs.');
+        return;
+      }
+      setDailyAttendance(data.dailyAttendance || {});
+      setSessionMeta(data.sessionMeta || {});
+      showNotice('Populated Week 1 FN & AN attendance logs.');
+    } catch {
+      showNotice('Network error populating Week 1 logs.');
+    }
+  }, [authToken, isAdminOrSuper, showNotice]);
 
-  // Compute global KPI stats for selected date
+  // Compute global KPI stats for selected date + FN & AN comparison
   const kpiStats = useMemo(() => {
     const itBatches = batches.filter((b) => b.trackType === 'IT');
     const totalEnrolled = itBatches.reduce((sum, b) => sum + b.studentCount, 0);
@@ -591,6 +731,9 @@ export default function App() {
     let od = 0;
     let absent = 0;
     let unmarked = 0;
+    let fnAttended = 0;
+    let anAttended = 0;
+    let fullDayStreaks = 0;
 
     students.forEach((s) => {
       const st = dayAttendance[s.id] || 'unmarked';
@@ -599,11 +742,27 @@ export default function App() {
       else if (st === 'od') od++;
       else if (st === 'absent') absent++;
       else unmarked++;
+
+      const fnSt = fnAttendance[s.id] || 'unmarked';
+      const anSt = anAttendance[s.id] || 'unmarked';
+      const fnOk = fnSt === 'present' || fnSt === 'late' || fnSt === 'od';
+      const anOk = anSt === 'present' || anSt === 'late' || anSt === 'od';
+      if (fnOk) fnAttended++;
+      if (anOk) anAttended++;
+      if (fnOk && anOk) fullDayStreaks++;
     });
 
     const attended = present + late + od;
     const attendanceRate =
       totalEnrolled > 0 ? ((attended / totalEnrolled) * 100).toFixed(1) : '0.0';
+    const fnRate =
+      totalEnrolled > 0 ? ((fnAttended / totalEnrolled) * 100).toFixed(1) : '0.0';
+    const anRate =
+      totalEnrolled > 0 ? ((anAttended / totalEnrolled) * 100).toFixed(1) : '0.0';
+    const fullDayRate =
+      totalEnrolled > 0
+        ? ((fullDayStreaks / totalEnrolled) * 100).toFixed(1)
+        : '0.0';
 
     let pendingBatches = 0;
     itBatches.forEach((b) => {
@@ -638,13 +797,27 @@ export default function App() {
       unmarked,
       attended,
       attendanceRate,
+      fnAttended,
+      fnRate,
+      anAttended,
+      anRate,
+      fullDayStreaks,
+      fullDayRate,
       pendingBatches,
       activePartners,
       assignedRooms,
     };
-  }, [batches, students, dayAttendance, daySessionMeta, studentsByBatch]);
+  }, [
+    batches,
+    students,
+    dayAttendance,
+    fnAttendance,
+    anAttendance,
+    daySessionMeta,
+    studentsByBatch,
+  ]);
 
-  // Enrich batches with live counts for the main table
+  // Enrich batches with live FN & AN counts for the main table
   const enrichedBatches = useMemo(() => {
     return batches.map((batch) => {
       const list = studentsByBatch.get(batch.id) || [];
@@ -653,6 +826,8 @@ export default function App() {
       let od = 0;
       let absent = 0;
       let unmarked = 0;
+      let fnAttended = 0;
+      let anAttended = 0;
 
       list.forEach((s) => {
         const st = dayAttendance[s.id] || 'unmarked';
@@ -661,11 +836,20 @@ export default function App() {
         else if (st === 'od') od++;
         else if (st === 'absent') absent++;
         else unmarked++;
+
+        const fnSt = fnAttendance[s.id] || 'unmarked';
+        const anSt = anAttendance[s.id] || 'unmarked';
+        if (fnSt === 'present' || fnSt === 'late' || fnSt === 'od') fnAttended++;
+        if (anSt === 'present' || anSt === 'late' || anSt === 'od') anAttended++;
       });
 
       const attended = present + late + od;
       const pct =
         batch.studentCount > 0 ? (attended / batch.studentCount) * 100 : 0;
+      const fnPct =
+        batch.studentCount > 0 ? (fnAttended / batch.studentCount) * 100 : 0;
+      const anPct =
+        batch.studentCount > 0 ? (anAttended / batch.studentCount) * 100 : 0;
 
       const explicitMeta = daySessionMeta[batch.id];
       let resolvedStatus: BatchSessionStatus = 'pending';
@@ -690,11 +874,25 @@ export default function App() {
         unmarked,
         attended,
         pct,
+        fnPct,
+        anPct,
         sessionStatus: resolvedStatus,
-        updatedAt: explicitMeta?.updatedAt || (resolvedStatus === 'pending' ? 'Awaiting roll call' : '—'),
+        updatedAt:
+          explicitMeta?.updatedAt ||
+          (resolvedStatus === 'pending'
+            ? `Awaiting ${activeSession} roll call`
+            : '—'),
       };
     });
-  }, [batches, studentsByBatch, dayAttendance, daySessionMeta]);
+  }, [
+    batches,
+    studentsByBatch,
+    dayAttendance,
+    fnAttendance,
+    anAttendance,
+    daySessionMeta,
+    activeSession,
+  ]);
 
   const filteredTableRows = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -719,15 +917,21 @@ export default function App() {
     return list.sort((a, b) => {
       let cmp = 0;
       if (sortKey === 'department') {
-        cmp = a.batch.department.localeCompare(b.batch.department);
+        cmp = compareLex(a.batch.department, b.batch.department);
       } else if (sortKey === 'enrolled') {
-        cmp = a.batch.studentCount - b.batch.studentCount;
+        cmp =
+          a.batch.studentCount - b.batch.studentCount ||
+          compareLex(a.batch.department, b.batch.department);
       } else if (sortKey === 'attendance') {
-        cmp = a.pct - b.pct;
+        cmp =
+          a.pct - b.pct ||
+          compareLex(a.batch.department, b.batch.department);
       } else if (sortKey === 'room') {
-        cmp = (a.batch.roomNumber || 'zzz').localeCompare(
-          b.batch.roomNumber || 'zzz'
-        );
+        cmp =
+          compareLex(
+            a.batch.roomNumber || '~~~',
+            b.batch.roomNumber || '~~~'
+          ) || compareLex(a.batch.department, b.batch.department);
       }
       return sortAsc ? cmp : -cmp;
     });
@@ -761,9 +965,14 @@ export default function App() {
       selectedDateKey,
       batches,
       students,
-      dayAttendance
+      fnAttendance,
+      anAttendance,
+      activeSession
     );
-    triggerDownload(`B2025-2029_Batch_Attendance_${selectedDateKey}.csv`, csv);
+    triggerDownload(
+      `B2025-2029_Batch_Attendance_${selectedDateKey}_${activeSession}.csv`,
+      csv
+    );
   };
 
   const handleExportStudentsCsv = () => {
@@ -771,40 +980,102 @@ export default function App() {
       selectedDateKey,
       batches,
       students,
-      dayAttendance
+      fnAttendance,
+      anAttendance
     );
-    triggerDownload(`B2025-2029_Student_RollCall_${selectedDateKey}.csv`, csv);
+    triggerDownload(
+      `B2025-2029_Student_RollCall_${selectedDateKey}.csv`,
+      csv
+    );
   };
+
+  const handleImportRosterPayload = useCallback(
+    async (
+      csvText: string,
+      defaultDepartment?: string,
+      fileName?: string
+    ): Promise<{ ok: boolean; message: string }> => {
+      if (!authToken || !isAdminOrSuper) {
+        setIsAuthModalOpen(true);
+        return { ok: false, message: 'Admin or Super Admin sign-in required.' };
+      }
+      try {
+        const res = await fetch('/api/cohort/import', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${authToken}`,
+          },
+          body: JSON.stringify({
+            csvText,
+            defaultDepartment: defaultDepartment || undefined,
+            fileName: fileName || undefined,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          const msg = data.error || 'CSV import failed.';
+          showNotice(msg);
+          return { ok: false, message: msg };
+        }
+        applyServerCohortPayload(data);
+        if (data.importMode === 'students') {
+          const msg = `Imported ${data.importedCount} unique students from Google Sheet roster.`;
+          showNotice(msg);
+          return { ok: true, message: msg };
+        }
+        setSelectedDateKey(workingDays[0]?.dateKey || '2026-11-24');
+        const msg = 'Imported batch allocation sheet across cohort.';
+        showNotice(msg);
+        return { ok: true, message: msg };
+      } catch {
+        const msg = 'Network error importing CSV.';
+        showNotice(msg);
+        return { ok: false, message: msg };
+      }
+    },
+    [authToken, isAdminOrSuper, applyServerCohortPayload, showNotice, workingDays]
+  );
 
   const handleImportCsvFile = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
+    if (!authToken || !isAdminOrSuper) {
+      setIsAuthModalOpen(true);
+      return;
+    }
+
     const reader = new FileReader();
-    reader.onload = () => {
-      if (typeof reader.result === 'string') {
-        initializeFromCsvText(reader.result);
-      }
+    reader.onload = async () => {
+      if (typeof reader.result !== 'string') return;
+      await handleImportRosterPayload(reader.result, undefined, file.name);
     };
     reader.readAsText(file);
-    e.target.value = '';
   };
 
   const handleResetToSource = async () => {
+    if (!authToken || !isAdminOrSuper) {
+      setIsAuthModalOpen(true);
+      return;
+    }
     setIsLiveSimulating(false);
     setLastLiveEvent(null);
-    localStorage.removeItem(STORAGE_KEY);
-    localStorage.removeItem(SCHEDULE_STORAGE_KEY);
-    setScheduleState({
-      enabled: true,
-      lastSyncSummary: null,
-      completedSlots: {},
-    });
     try {
-      const res = await fetch(SOURCE_CSV_URL);
-      const text = res.ok ? await res.text() : FALLBACK_CSV_TEXT;
-      initializeFromCsvText(text);
+      const res = await fetch('/api/cohort/reset', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        showNotice(data.error || 'Reset failed.');
+        return;
+      }
+      applyServerCohortPayload(data);
+      setSelectedDateKey(workingDays[0]?.dateKey || '2026-11-24');
+      showNotice('Cohort data reset to source sheet.');
     } catch {
-      initializeFromCsvText(FALLBACK_CSV_TEXT);
+      showNotice('Network error resetting cohort data.');
     }
   };
 
@@ -817,16 +1088,26 @@ export default function App() {
     }
   };
 
-  const navItems: {
-    id: DashboardView;
-    label: string;
-    icon: React.ComponentType<{ className?: string }>;
-  }[] = [
-    { id: 'overview', label: 'Overview & Tracking', icon: LayoutDashboard },
-    { id: 'students', label: 'Student Roster', icon: Users },
-    { id: 'directory', label: 'Partners & Venues', icon: Building2 },
-    { id: 'schedule', label: '17-Day Schedule', icon: CalendarDays },
-  ];
+  const navItems = useMemo(() => {
+    const base: {
+      id: DashboardView;
+      label: string;
+      icon: React.ComponentType<{ className?: string }>;
+    }[] = [
+      { id: 'overview', label: 'Overview & Tracking', icon: LayoutDashboard },
+      { id: 'students', label: 'Student Roster', icon: Users },
+      { id: 'directory', label: 'Partners & Venues', icon: Building2 },
+      { id: 'schedule', label: '17-Day Schedule', icon: CalendarDays },
+    ];
+    if (isAdminOrSuper) {
+      base.push({
+        id: 'access',
+        label: 'Access & Credentials',
+        icon: ShieldCheck,
+      });
+    }
+    return base;
+  }, [isAdminOrSuper]);
 
   const renderSessionStatus = (st: BatchSessionStatus) => {
     switch (st) {
@@ -859,6 +1140,19 @@ export default function App() {
         );
     }
   };
+
+  const roleBadgeLabel = useMemo(() => {
+    if (!currentUser || currentUser.role === 'guest') {
+      return 'Guest · View Only';
+    }
+    if (currentUser.role === 'superadmin') {
+      return 'Super Admin · Full Access';
+    }
+    if (currentUser.role === 'admin') {
+      return 'Admin · Full Access';
+    }
+    return `Faculty · ${[...currentUser.assignedDepartments].sort(compareLex).join(', ')}`;
+  }, [currentUser]);
 
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-[#090D16] text-slate-900 dark:text-slate-100 flex transition-colors duration-150">
@@ -901,6 +1195,45 @@ export default function App() {
             </button>
           </div>
 
+          {/* Signed-in Session Card */}
+          <div className="mx-3 mt-3 p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/80 dark:bg-slate-900/60 space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] font-mono uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                Active Role
+              </span>
+              {!isAuthenticatedEditor && (
+                <Lock className="w-3 h-3 text-slate-400" />
+              )}
+            </div>
+            <div className="text-xs font-semibold text-slate-900 dark:text-white truncate">
+              {currentUser ? currentUser.displayName : 'Guest Viewer'}
+            </div>
+            <div className="text-[11px] font-mono text-slate-500 dark:text-slate-400 truncate">
+              {roleBadgeLabel}
+            </div>
+            {isAuthenticatedEditor ? (
+              <button
+                type="button"
+                onClick={handleLogout}
+                className="w-full inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                Sign Out (Guest Mode)
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setIsAuthModalOpen(true)}
+                className="w-full inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-lg bg-blue-600 hover:bg-blue-700 text-white transition-colors"
+              >
+                <LogIn className="w-3.5 h-3.5" />
+                {!superAdminClaimed
+                  ? 'Setup / Staff Sign In'
+                  : 'Faculty / Admin Sign In'}
+              </button>
+            )}
+          </div>
+
           {/* Primary Views */}
           <nav className="p-3 space-y-1" aria-label="Primary sections">
             {navItems.map((item) => {
@@ -927,32 +1260,37 @@ export default function App() {
             })}
           </nav>
 
-          {/* Daily 3-Slot Auto-Update Schedule (10 AM, 1 PM, 3 PM) */}
-          <div className="mx-3 mt-3 p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900/50 space-y-2.5">
+          {/* Daily 3-Slot Auto-Update Schedule (10 AM -> FN, 1 PM & 3 PM -> AN) */}
+          <div className="mx-3 mt-1 p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900/50 space-y-2.5">
             <div className="flex items-center justify-between gap-2">
               <span className="text-xs font-semibold text-slate-800 dark:text-slate-200">
                 Daily Auto-Update
               </span>
-              <button
-                type="button"
-                onClick={() =>
-                  setScheduleState((prev) => ({ ...prev, enabled: !prev.enabled }))
-                }
-                className={`px-2 py-0.5 text-[11px] font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 ${
-                  scheduleState.enabled
-                    ? 'bg-emerald-600 border-emerald-600 text-white hover:bg-emerald-700'
-                    : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300'
-                }`}
-              >
-                {scheduleState.enabled ? 'Active' : 'Paused'}
-              </button>
+              {isAdminOrSuper ? (
+                <button
+                  type="button"
+                  onClick={handleToggleSchedule}
+                  className={`px-2 py-0.5 text-[11px] font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 ${
+                    scheduleState.enabled
+                      ? 'bg-emerald-600 border-emerald-600 text-white hover:bg-emerald-700'
+                      : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300'
+                  }`}
+                >
+                  {scheduleState.enabled ? 'Active' : 'Paused'}
+                </button>
+              ) : (
+                <span className="text-[11px] font-mono text-slate-500 dark:text-slate-400">
+                  {scheduleState.enabled ? 'Active' : 'Paused'}
+                </span>
+              )}
             </div>
 
             <div className="text-[11px] font-mono tabular-nums text-slate-500 dark:text-slate-400">
               {scheduleState.enabled ? (
                 <>
                   Next: {nextScheduleInfo.isTomorrow ? 'Tomorrow ' : ''}
-                  {nextScheduleInfo.checkpoint.timeLabel} ({nextScheduleInfo.countdownLabel})
+                  {nextScheduleInfo.checkpoint.timeLabel} ({nextScheduleInfo.checkpoint.session} ·{' '}
+                  {nextScheduleInfo.countdownLabel})
                 </>
               ) : (
                 'Scheduled updates paused'
@@ -969,70 +1307,77 @@ export default function App() {
                   >
                     <div className="min-w-0">
                       <span className="font-medium text-slate-700 dark:text-slate-200">
-                        {cp.label}
+                        {cp.session}
                       </span>
                       <span className="text-slate-400 mx-1">·</span>
                       <span className="font-mono tabular-nums text-slate-500 dark:text-slate-400">
                         {cp.timeLabel}
                       </span>
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => handleRunCheckpoint(cp)}
-                      title={`Run ${cp.label} (${cp.timeLabel}) attendance update now`}
-                      className={`px-2 py-0.5 rounded border text-[10px] font-medium transition-colors whitespace-nowrap shrink-0 ${
-                        doneTime
-                          ? 'border-emerald-200 dark:border-emerald-800/70 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300'
-                          : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700'
-                      }`}
-                    >
-                      {doneTime ? `Done ${doneTime}` : 'Run Now'}
-                    </button>
+                    {isAuthenticatedEditor ? (
+                      <button
+                        type="button"
+                        onClick={() => handleRunCheckpoint(cp)}
+                        title={`Run ${cp.label} ${cp.session} (${cp.timeLabel}) attendance update now`}
+                        className={`px-2 py-0.5 rounded border text-[10px] font-medium transition-colors whitespace-nowrap shrink-0 ${
+                          doneTime
+                            ? 'border-emerald-200 dark:border-emerald-800/70 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300'
+                            : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700'
+                        }`}
+                      >
+                        {doneTime ? `Done ${doneTime}` : 'Run Now'}
+                      </button>
+                    ) : (
+                      <span className="text-[10px] font-mono text-slate-400 dark:text-slate-500">
+                        {doneTime ? `Done ${doneTime}` : 'Scheduled'}
+                      </span>
+                    )}
                   </div>
                 );
               })}
             </div>
           </div>
 
-          {/* Live Check-in Simulator Control */}
-          <div className="mx-3 mt-3 p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900/50 space-y-2.5">
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-xs font-semibold text-slate-800 dark:text-slate-200">
-                Live Check-In Stream
-              </span>
-              <button
-                type="button"
-                onClick={() => setIsLiveSimulating((prev) => !prev)}
-                className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
-                  isLiveSimulating
-                    ? 'bg-emerald-600 text-white hover:bg-emerald-700'
-                    : 'bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700'
-                }`}
-              >
-                {isLiveSimulating ? (
-                  <>
-                    <Pause className="w-3 h-3" />
-                    Pause
-                  </>
-                ) : (
-                  <>
-                    <Play className="w-3 h-3" />
-                    Start
-                  </>
-                )}
-              </button>
+          {/* Live Check-in Simulator Control (Staff Only) */}
+          {isAuthenticatedEditor && (
+            <div className="mx-3 mt-3 p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900/50 space-y-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-semibold text-slate-800 dark:text-slate-200">
+                  Live Check-In ({activeSession})
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setIsLiveSimulating((prev) => !prev)}
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                    isLiveSimulating
+                      ? 'bg-emerald-600 text-white hover:bg-emerald-700'
+                      : 'bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700'
+                  }`}
+                >
+                  {isLiveSimulating ? (
+                    <>
+                      <Pause className="w-3 h-3" />
+                      Pause
+                    </>
+                  ) : (
+                    <>
+                      <Play className="w-3 h-3" />
+                      Start
+                    </>
+                  )}
+                </button>
+              </div>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-relaxed">
+                {isLiveSimulating
+                  ? lastLiveEvent || `Recording live ${activeSession} check-ins...`
+                  : `Stream simulated ${activeSession} check-ins across your permitted batches.`}
+              </p>
             </div>
-            <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-relaxed">
-              {isLiveSimulating
-                ? lastLiveEvent || 'Recording live roll-call check-ins...'
-                : 'Stream simulated student check-ins across active venues.'}
-            </p>
-          </div>
+          )}
         </div>
 
-        {/* Bottom Workspace Utilities: Theme Switcher & CSV Actions */}
+        {/* Bottom Workspace Utilities: Theme Switcher & Admin CSV Actions */}
         <div className="p-3 border-t border-slate-200 dark:border-slate-800 space-y-3">
-          {/* Light / Dark Theme Segmented Control */}
           <div>
             <div className="text-[11px] font-medium text-slate-500 dark:text-slate-400 px-1 mb-1.5">
               Appearance
@@ -1069,24 +1414,26 @@ export default function App() {
             </div>
           </div>
 
-          <div className="grid grid-cols-2 gap-2">
-            <button
-              type="button"
-              onClick={() => fileInputRef.current?.click()}
-              className="inline-flex items-center justify-center gap-1.5 px-2.5 py-2 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors whitespace-nowrap"
-            >
-              <Upload className="w-3.5 h-3.5" />
-              Import CSV
-            </button>
-            <button
-              type="button"
-              onClick={handleResetToSource}
-              className="inline-flex items-center justify-center gap-1.5 px-2.5 py-2 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors whitespace-nowrap"
-            >
-              <RotateCcw className="w-3.5 h-3.5" />
-              Reset Data
-            </button>
-          </div>
+          {isAdminOrSuper && (
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                className="inline-flex items-center justify-center gap-1.5 px-2.5 py-2 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors whitespace-nowrap"
+              >
+                <Upload className="w-3.5 h-3.5" />
+                Import CSV
+              </button>
+              <button
+                type="button"
+                onClick={handleResetToSource}
+                className="inline-flex items-center justify-center gap-1.5 px-2.5 py-2 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors whitespace-nowrap"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                Reset Data
+              </button>
+            </div>
+          )}
         </div>
       </aside>
 
@@ -1116,18 +1463,40 @@ export default function App() {
                 /
               </span>
               <span className="hidden sm:inline font-mono tabular-nums text-slate-700 dark:text-slate-300">
-                {currentDay?.dayLabel} ({currentDay?.label})
+                {currentDay?.dayLabel} · {activeSession}
               </span>
             </div>
           </div>
 
-          <div className="flex items-center gap-3 shrink-0">
+          <div className="flex items-center gap-2.5 shrink-0">
+            {/* FN / AN Session Switcher */}
+            <div
+              className="inline-flex items-center p-1 bg-slate-100 dark:bg-slate-800 rounded-lg border border-slate-200/80 dark:border-slate-700"
+              role="group"
+              aria-label="Session switcher"
+            >
+              {(['FN', 'AN'] as SessionPeriod[]).map((sess) => (
+                <button
+                  key={sess}
+                  type="button"
+                  onClick={() => setActiveSession(sess)}
+                  className={`px-2.5 py-1 text-xs font-mono font-semibold rounded-md transition-colors whitespace-nowrap ${
+                    activeSession === sess
+                      ? 'bg-white dark:bg-[#111827] text-slate-900 dark:text-white shadow-xs'
+                      : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                  }`}
+                >
+                  {sess}
+                </button>
+              ))}
+            </div>
+
             {/* Quick Day Selector */}
             <select
               value={selectedDateKey}
               onChange={(e) => setSelectedDateKey(e.target.value)}
               aria-label="Select internship session day"
-              className="hidden sm:block text-xs font-mono tabular-nums rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="hidden md:block text-xs font-mono tabular-nums rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
             >
               {workingDays.map((d) => (
                 <option key={d.dateKey} value={d.dateKey}>
@@ -1139,18 +1508,73 @@ export default function App() {
             <button
               type="button"
               onClick={handleExportBatchCsv}
-              className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium rounded-lg bg-blue-600 hover:bg-blue-700 dark:bg-blue-500 dark:hover:bg-blue-600 text-white transition-colors whitespace-nowrap shrink-0"
+              className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0"
             >
               <Download className="w-3.5 h-3.5" />
-              Export CSV
+              <span className="hidden sm:inline">Export CSV</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() =>
+                isAuthenticatedEditor ? handleLogout() : setIsAuthModalOpen(true)
+              }
+              className={`inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium rounded-lg transition-colors whitespace-nowrap shrink-0 ${
+                isAuthenticatedEditor
+                  ? 'border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 hover:bg-slate-50 dark:hover:bg-slate-800'
+                  : 'bg-blue-600 hover:bg-blue-700 dark:bg-blue-500 dark:hover:bg-blue-600 text-white'
+              }`}
+            >
+              {isAuthenticatedEditor ? (
+                <>
+                  <LogOut className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Sign Out</span>
+                </>
+              ) : (
+                <>
+                  <LogIn className="w-3.5 h-3.5" />
+                  <span>Sign In</span>
+                </>
+              )}
             </button>
           </div>
         </header>
 
         {/* Main Workspace Container */}
         <main className="flex-1 p-4 sm:p-6 lg:p-8 max-w-[1440px] w-full mx-auto space-y-6">
+          {/* First-Run Setup / Role Notice Banner */}
+          {!superAdminClaimed && (
+            <div className="bg-white dark:bg-[#111827] border border-blue-300 dark:border-blue-800/70 rounded-xl px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+              <div className="text-xs text-slate-700 dark:text-slate-200">
+                <strong className="text-slate-900 dark:text-white">
+                  First-Run Setup Available:
+                </strong>{' '}
+                Initialize the Super Admin password to manage Admin credentials and generate login passwords for all {facultyDirectory.length} Faculty Incharges.
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsAuthModalOpen(true)}
+                className="px-3 py-1.5 text-xs font-medium rounded-lg bg-blue-600 hover:bg-blue-700 text-white whitespace-nowrap shrink-0"
+              >
+                Initialize Super Admin
+              </button>
+            </div>
+          )}
+
+          {actionFeedback && (
+            <div className="bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/70 rounded-xl px-4 py-2.5 text-xs text-amber-800 dark:text-amber-300 flex items-center justify-between gap-3">
+              <span>{actionFeedback}</span>
+              <button
+                type="button"
+                onClick={() => setActionFeedback(null)}
+                className="text-xs font-medium hover:underline"
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
+
           {loading ? (
-            /* Skeleton Loading State */
             <div className="space-y-6 animate-pulse">
               <div className="h-20 rounded-xl bg-slate-200/70 dark:bg-slate-800/60" />
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -1181,7 +1605,18 @@ export default function App() {
                           {kpiStats.totalEnrolled} IT Students
                         </span>
                         <span aria-hidden="true">·</span>
-                        <span>{kpiStats.totalBatches} Department Batches (18 IT + 1 CORE)</span>
+                        <span>
+                          Active Session:{' '}
+                          <strong className="text-slate-800 dark:text-slate-200">
+                            {activeSession === 'FN'
+                              ? 'FN (Forenoon)'
+                              : 'AN (Afternoon)'}
+                          </strong>
+                        </span>
+                        <span aria-hidden="true">·</span>
+                        <span className="font-mono text-xs text-slate-600 dark:text-slate-300">
+                          {roleBadgeLabel}
+                        </span>
                       </div>
                     </div>
 
@@ -1196,19 +1631,19 @@ export default function App() {
                       </button>
 
                       {/* Mobile Day Picker */}
-                      <div className="sm:hidden flex-1">
-                      <select
-                        value={selectedDateKey}
-                        onChange={(e) => setSelectedDateKey(e.target.value)}
-                        aria-label="Select internship session day"
-                        className="w-full text-xs font-mono tabular-nums rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 px-3 py-2"
-                      >
-                        {workingDays.map((d) => (
-                          <option key={d.dateKey} value={d.dateKey}>
-                            {d.dayLabel} · {d.label} ({d.weekday})
-                          </option>
-                        ))}
-                      </select>
+                      <div className="md:hidden flex-1">
+                        <select
+                          value={selectedDateKey}
+                          onChange={(e) => setSelectedDateKey(e.target.value)}
+                          aria-label="Select internship session day"
+                          className="w-full text-xs font-mono tabular-nums rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 px-3 py-2"
+                        >
+                          {workingDays.map((d) => (
+                            <option key={d.dateKey} value={d.dateKey}>
+                              {d.dayLabel} · {d.label} ({d.weekday})
+                            </option>
+                          ))}
+                        </select>
                       </div>
                     </div>
                   </div>
@@ -1218,14 +1653,14 @@ export default function App() {
                     <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
                       <span className="inline-flex items-center gap-1.5 font-semibold text-slate-900 dark:text-white">
                         <Clock className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
-                        Scheduled Daily Sync (10:00 AM · 01:00 PM · 03:00 PM)
+                        Scheduled Sync (10:00 AM FN · 01:00 PM AN · 03:00 PM AN)
                       </span>
                       <span className="text-slate-300 dark:text-slate-700">|</span>
                       <span className="font-mono tabular-nums text-slate-500 dark:text-slate-400">
                         {scheduleState.lastSyncSummary
                           ? scheduleState.lastSyncSummary
                           : scheduleState.enabled
-                          ? `Next automatic pass: ${nextScheduleInfo.isTomorrow ? 'Tomorrow ' : ''}${nextScheduleInfo.checkpoint.timeLabel} (${nextScheduleInfo.countdownLabel})`
+                          ? `Next automatic pass: ${nextScheduleInfo.isTomorrow ? 'Tomorrow ' : ''}${nextScheduleInfo.checkpoint.timeLabel} (${nextScheduleInfo.checkpoint.session} · ${nextScheduleInfo.countdownLabel})`
                           : 'Auto-schedule paused'}
                       </span>
                     </div>
@@ -1237,14 +1672,20 @@ export default function App() {
                           <button
                             key={cp.id}
                             type="button"
+                            disabled={!isAuthenticatedEditor}
                             onClick={() => handleRunCheckpoint(cp)}
+                            title={
+                              isAuthenticatedEditor
+                                ? `Run ${cp.label} ${cp.session} sync now`
+                                : 'Sign in as Faculty or Admin to run scheduled sync'
+                            }
                             className={`px-2.5 py-1 text-xs font-medium rounded-md border transition-colors whitespace-nowrap shrink-0 ${
                               doneTime
                                 ? 'border-emerald-200 dark:border-emerald-800/70 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300'
                                 : 'border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800'
-                            }`}
+                            } ${!isAuthenticatedEditor ? 'opacity-70 cursor-default' : ''}`}
                           >
-                            {cp.label} {cp.timeLabel}
+                            {cp.session} · {cp.timeLabel}
                             {doneTime ? ` · ${doneTime}` : ''}
                           </button>
                         );
@@ -1270,13 +1711,13 @@ export default function App() {
                         </span>
                       </div>
                       <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">
-                        Plus Mech (CORE Track) · {kpiStats.activePartners} partners
+                        {kpiStats.activePartners} training partners · Mech CORE
                       </div>
                     </div>
 
                     <div className="bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 rounded-xl p-5">
                       <div className="text-xs font-medium text-slate-500 dark:text-slate-400">
-                        Attended ({currentDay?.label})
+                        {activeSession} Attended ({currentDay?.label})
                       </div>
                       <div className="mt-2 flex items-baseline justify-between gap-2">
                         <span className="text-3xl font-bold font-mono tabular-nums text-emerald-700 dark:text-emerald-400">
@@ -1287,30 +1728,30 @@ export default function App() {
                         </span>
                       </div>
                       <div className="mt-2 text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums">
-                        Present {kpiStats.present} · Late {kpiStats.late} · OD {kpiStats.od}
+                        FN: {kpiStats.fnRate}% · AN: {kpiStats.anRate}%
                       </div>
                     </div>
 
                     <div className="bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 rounded-xl p-5">
                       <div className="text-xs font-medium text-slate-500 dark:text-slate-400">
-                        Absent & Unmarked
+                        Full-Day (FN + AN) Streaks
                       </div>
                       <div className="mt-2 flex items-baseline justify-between gap-2">
-                        <span className="text-3xl font-bold font-mono tabular-nums text-rose-700 dark:text-rose-400">
-                          {kpiStats.absent}
+                        <span className="text-3xl font-bold font-mono tabular-nums text-blue-700 dark:text-blue-400">
+                          {kpiStats.fullDayStreaks}
                         </span>
-                        <span className="text-xs font-mono tabular-nums text-slate-500 dark:text-slate-400">
-                          {kpiStats.unmarked} unmarked
+                        <span className="text-sm font-semibold font-mono tabular-nums text-blue-700 dark:text-blue-400">
+                          {kpiStats.fullDayRate}%
                         </span>
                       </div>
-                      <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">
-                        Across {kpiStats.itBatchCount} tracked IT sections
+                      <div className="mt-2 text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums">
+                        {activeSession} Absent: {kpiStats.absent} · Unmarked: {kpiStats.unmarked}
                       </div>
                     </div>
 
                     <div className="bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 rounded-xl p-5">
                       <div className="text-xs font-medium text-slate-500 dark:text-slate-400">
-                        Roll Call Completion
+                        {activeSession} Roll Call Completion
                       </div>
                       <div className="mt-2 flex items-baseline justify-between gap-2">
                         <span className="text-3xl font-bold font-mono tabular-nums text-slate-900 dark:text-white">
@@ -1326,16 +1767,17 @@ export default function App() {
                     </div>
                   </section>
 
-                  {/* Interactive Session Day Strip */}
-                  <div className="bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 rounded-xl p-3">
-                    <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
+                  {/* Interactive Session Day Strip + FN/AN Switch */}
+                  <div className="bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 rounded-xl p-3 flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex items-center gap-1.5 overflow-x-auto pb-1 flex-1 min-w-0">
                       {workingDays.map((day) => {
                         const isSelected = day.dateKey === selectedDateKey;
-                        const hasMarks =
-                          dailyAttendance[day.dateKey] &&
-                          Object.values(dailyAttendance[day.dateKey]).some(
-                            (v) => v !== 'unmarked'
-                          );
+                        const fnMarked = Object.values(
+                          dailyAttendance[makeSessionKey(day.dateKey, 'FN')] || {}
+                        ).some((v) => v !== 'unmarked');
+                        const anMarked = Object.values(
+                          dailyAttendance[makeSessionKey(day.dateKey, 'AN')] || {}
+                        ).some((v) => v !== 'unmarked');
                         return (
                           <button
                             key={day.dateKey}
@@ -1349,7 +1791,7 @@ export default function App() {
                           >
                             <div className="flex items-center gap-1.5 text-[10px] font-mono uppercase opacity-80">
                               <span>{day.dayLabel}</span>
-                              {hasMarks && !isSelected && (
+                              {(fnMarked || anMarked) && !isSelected && (
                                 <span className="text-emerald-600 dark:text-emerald-400 font-bold">
                                   ·
                                 </span>
@@ -1361,6 +1803,27 @@ export default function App() {
                           </button>
                         );
                       })}
+                    </div>
+
+                    <div
+                      className="inline-flex items-center p-1 bg-slate-100 dark:bg-slate-800 rounded-lg shrink-0"
+                      role="group"
+                      aria-label="Session period"
+                    >
+                      {(['FN', 'AN'] as SessionPeriod[]).map((sess) => (
+                        <button
+                          key={sess}
+                          type="button"
+                          onClick={() => setActiveSession(sess)}
+                          className={`px-3 py-1.5 text-xs font-mono font-semibold rounded-md transition-colors whitespace-nowrap ${
+                            activeSession === sess
+                              ? 'bg-white dark:bg-[#111827] text-slate-900 dark:text-white shadow-xs'
+                              : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                          }`}
+                        >
+                          {sess === 'FN' ? 'FN · Forenoon' : 'AN · Afternoon'}
+                        </button>
+                      ))}
                     </div>
                   </div>
 
@@ -1379,14 +1842,18 @@ export default function App() {
 
                   {/* Live Batch Tracking Table */}
                   <section className="bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
-                    {/* Table Toolbar */}
                     <div className="p-5 border-b border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-4">
                       <div>
                         <h2 className="text-base font-semibold text-slate-900 dark:text-white tracking-tight">
-                          Live Batch Attendance Tracker
+                          Live Batch Attendance Tracker ({activeSession})
                         </h2>
                         <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                          Adjust live headcounts directly or open any batch for student-by-student roll call
+                          Showing {activeSession === 'FN' ? 'Forenoon (FN)' : 'Afternoon (AN)'} status with comparative FN % and AN % ·{' '}
+                          {currentUser?.role === 'faculty'
+                            ? `Editable for: ${[...currentUser.assignedDepartments].sort(compareLex).join(', ')}`
+                            : isAdminOrSuper
+                            ? 'Full editing enabled'
+                            : 'View-only in Guest mode'}
                         </p>
                       </div>
 
@@ -1421,7 +1888,6 @@ export default function App() {
                       </div>
                     </div>
 
-                    {/* Data Grid */}
                     <div className="overflow-x-auto">
                       <table className="w-full text-left border-collapse">
                         <thead>
@@ -1443,11 +1909,10 @@ export default function App() {
                                 onClick={() => toggleSort('room')}
                                 className="inline-flex items-center gap-1 hover:text-slate-900 dark:hover:text-white"
                               >
-                                Venue & Room
+                                Venue &amp; Room
                                 <ArrowUpDown className="w-3 h-3" />
                               </button>
                             </th>
-                            <th className="py-3 px-4">Expert & Faculty</th>
                             <th className="py-3 px-4 text-right">
                               <button
                                 type="button"
@@ -1458,13 +1923,15 @@ export default function App() {
                                 <ArrowUpDown className="w-3 h-3" />
                               </button>
                             </th>
+                            <th className="py-3 px-3 text-right">FN %</th>
+                            <th className="py-3 px-3 text-right">AN %</th>
                             <th className="py-3 px-4 text-right">
                               <button
                                 type="button"
                                 onClick={() => toggleSort('attendance')}
                                 className="inline-flex items-center gap-1 hover:text-slate-900 dark:hover:text-white"
                               >
-                                Live Attendance
+                                {activeSession} Live Count
                                 <ArrowUpDown className="w-3 h-3" />
                               </button>
                             </th>
@@ -1476,7 +1943,7 @@ export default function App() {
                           {filteredTableRows.length === 0 ? (
                             <tr>
                               <td
-                                colSpan={8}
+                                colSpan={9}
                                 className="py-10 px-4 text-center text-sm text-slate-500 dark:text-slate-400"
                               >
                                 No batches match your current search or filter.
@@ -1486,6 +1953,7 @@ export default function App() {
                             filteredTableRows.map((row) => {
                               const { batch } = row;
                               const isCore = batch.trackType === 'CORE';
+                              const canMarkThisBatch = canMarkDepartment(batch.department);
                               return (
                                 <tr
                                   key={batch.id}
@@ -1520,17 +1988,14 @@ export default function App() {
                                         : '—'}
                                     </div>
                                   </td>
-                                  <td className="py-3 px-4 text-xs max-w-[240px]">
-                                    <div className="font-medium text-slate-800 dark:text-slate-200 truncate">
-                                      {batch.expertName || 'Unassigned'}
-                                    </div>
-                                    <div className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
-                                      {batch.facultyIncharge.join(', ') ||
-                                        'No faculty assigned'}
-                                    </div>
-                                  </td>
                                   <td className="py-3 px-4 text-right font-mono tabular-nums text-xs font-semibold text-slate-900 dark:text-slate-100 whitespace-nowrap">
                                     {isCore ? 'CORE' : batch.studentCount}
+                                  </td>
+                                  <td className="py-3 px-3 text-right font-mono tabular-nums text-xs font-medium text-slate-700 dark:text-slate-300 whitespace-nowrap">
+                                    {isCore ? '—' : `${Math.round(row.fnPct)}%`}
+                                  </td>
+                                  <td className="py-3 px-3 text-right font-mono tabular-nums text-xs font-medium text-slate-700 dark:text-slate-300 whitespace-nowrap">
+                                    {isCore ? '—' : `${Math.round(row.anPct)}%`}
                                   </td>
                                   <td className="py-3 px-4 text-right whitespace-nowrap">
                                     {isCore ? (
@@ -1550,30 +2015,32 @@ export default function App() {
                                             A:{row.absent} · U:{row.unmarked}
                                           </div>
                                         </div>
-                                        <div className="inline-flex items-center border border-slate-200 dark:border-slate-700 rounded-md overflow-hidden">
-                                          <button
-                                            type="button"
-                                            onClick={() =>
-                                              handleQuickAdjustPresent(batch.id, -1)
-                                            }
-                                            title="Decrement present count"
-                                            aria-label={`Mark one student absent in ${batch.department}`}
-                                            className="p-1 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-rose-600 dark:hover:text-rose-400"
-                                          >
-                                            <Minus className="w-3 h-3" />
-                                          </button>
-                                          <button
-                                            type="button"
-                                            onClick={() =>
-                                              handleQuickAdjustPresent(batch.id, 1)
-                                            }
-                                            title="Increment present count"
-                                            aria-label={`Mark one student present in ${batch.department}`}
-                                            className="p-1 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-emerald-600 dark:hover:text-emerald-400 border-l border-slate-200 dark:border-slate-700"
-                                          >
-                                            <Plus className="w-3 h-3" />
-                                          </button>
-                                        </div>
+                                        {canMarkThisBatch && (
+                                          <div className="inline-flex items-center border border-slate-200 dark:border-slate-700 rounded-md overflow-hidden">
+                                            <button
+                                              type="button"
+                                              onClick={() =>
+                                                handleQuickAdjustPresent(batch.id, -1)
+                                              }
+                                              title="Decrement present count"
+                                              aria-label={`Mark one student absent in ${batch.department}`}
+                                              className="p-1 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-rose-600 dark:hover:text-rose-400"
+                                            >
+                                              <Minus className="w-3 h-3" />
+                                            </button>
+                                            <button
+                                              type="button"
+                                              onClick={() =>
+                                                handleQuickAdjustPresent(batch.id, 1)
+                                              }
+                                              title="Increment present count"
+                                              aria-label={`Mark one student present in ${batch.department}`}
+                                              className="p-1 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-emerald-600 dark:hover:text-emerald-400 border-l border-slate-200 dark:border-slate-700"
+                                            >
+                                              <Plus className="w-3 h-3" />
+                                            </button>
+                                          </div>
+                                        )}
                                       </div>
                                     )}
                                   </td>
@@ -1585,7 +2052,7 @@ export default function App() {
                                   </td>
                                   <td className="py-3 px-4 text-right whitespace-nowrap">
                                     <div className="inline-flex items-center gap-2">
-                                      {!isCore && row.unmarked > 0 && (
+                                      {canMarkThisBatch && !isCore && row.unmarked > 0 && (
                                         <button
                                           type="button"
                                           onClick={() =>
@@ -1604,13 +2071,19 @@ export default function App() {
                                         type="button"
                                         onClick={() => {
                                           setDrawerInitialTab(
-                                            isCore ? 'allocation' : 'rollcall'
+                                            isCore && isAdminOrSuper ? 'allocation' : 'rollcall'
                                           );
                                           setDrawerBatchId(batch.id);
                                         }}
                                         className="px-2.5 py-1 text-xs font-medium rounded-md border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
                                       >
-                                        {isCore ? 'Edit Track' : 'Roll Call'}
+                                        {isCore
+                                          ? isAdminOrSuper
+                                            ? 'Edit Track'
+                                            : 'Details'
+                                          : canMarkThisBatch
+                                          ? 'Roll Call'
+                                          : 'Inspect'}
                                       </button>
                                     </div>
                                   </td>
@@ -1630,10 +2103,14 @@ export default function App() {
                 <StudentRosterView
                   batches={batches}
                   students={students}
-                  dayAttendance={dayAttendance}
+                  fnAttendance={fnAttendance}
+                  anAttendance={anAttendance}
                   dayLabel={currentDay?.dayLabel || 'Day 01'}
                   dateKey={selectedDateKey}
-                  onSetStudentStatus={handleSetStudentStatus}
+                  canMarkDepartment={canMarkDepartment}
+                  canImportRoster={isAdminOrSuper}
+                  onImportRoster={handleImportRosterPayload}
+                  onSetStudentSessionStatus={handleSetStudentSessionStatus}
                   onSelectBatch={(batchId) => {
                     setDrawerInitialTab('rollcall');
                     setDrawerBatchId(batchId);
@@ -1646,6 +2123,7 @@ export default function App() {
               {activeView === 'directory' && (
                 <DirectoryView
                   batches={batches}
+                  canEditAllocations={isAdminOrSuper}
                   onEditBatchAllocation={(batchId) => {
                     setDrawerInitialTab('allocation');
                     setDrawerBatchId(batchId);
@@ -1660,7 +2138,10 @@ export default function App() {
                   students={students}
                   days={days}
                   selectedDateKey={selectedDateKey}
+                  activeSession={activeSession}
+                  onChangeSession={setActiveSession}
                   dailyAttendance={dailyAttendance}
+                  canPopulateWeekLogs={isAdminOrSuper}
                   onSelectDay={(dk) => setSelectedDateKey(dk)}
                   onJumpToDayBatch={(dk, batchId) => {
                     setSelectedDateKey(dk);
@@ -1668,6 +2149,14 @@ export default function App() {
                     setDrawerBatchId(batchId);
                   }}
                   onPopulateWeekPreview={handlePopulateWeekPreview}
+                />
+              )}
+
+              {/* Access & Faculty Credentials View (Admin & Super Admin) */}
+              {activeView === 'access' && isAdminOrSuper && currentUser && authToken && (
+                <AccessControlView
+                  currentUser={currentUser}
+                  authToken={authToken}
                 />
               )}
             </>
@@ -1681,9 +2170,14 @@ export default function App() {
         students={students}
         dayLabel={currentDay?.dayLabel || 'Day 01'}
         dateKey={selectedDateKey}
+        activeSession={activeSession}
+        onChangeSession={setActiveSession}
         dayAttendance={dayAttendance}
+        pairedDayAttendance={pairedDayAttendance}
         sessionStatus={drawerSessionStatus}
         initialTab={drawerInitialTab}
+        canMarkAttendance={drawerBatch ? canMarkDepartment(drawerBatch.department) : false}
+        canEditAllocation={isAdminOrSuper}
         onClose={() => setDrawerBatchId(null)}
         onSetStudentStatus={handleSetStudentStatus}
         onBulkSetBatchStatus={handleBulkSetBatchStatus}
@@ -1691,22 +2185,42 @@ export default function App() {
         onUpdateBatch={handleUpdateBatch}
       />
 
-      {/* Daily Attendance Summary Modal */}
+      {/* Daily Attendance Summary Modal (Accessible to Guests & All Roles) */}
       <DailySummaryModal
         isOpen={isDailySummaryOpen}
         onClose={() => setIsDailySummaryOpen(false)}
         programTitle={programTitle}
         dayLabel={currentDay?.dayLabel || 'Day 01'}
         dateKey={selectedDateKey}
+        initialSession={activeSession}
         batches={batches}
         students={students}
-        dayAttendance={dayAttendance}
+        fnAttendance={fnAttendance}
+        anAttendance={anAttendance}
         onExportCsv={handleExportBatchCsv}
-        onSelectBatch={(batchId) => {
+        onSelectBatch={(batchId, sess) => {
           setIsDailySummaryOpen(false);
+          setActiveSession(sess);
           const target = batches.find((b) => b.id === batchId);
-          setDrawerInitialTab(target?.trackType === 'CORE' ? 'allocation' : 'rollcall');
+          setDrawerInitialTab(
+            target?.trackType === 'CORE' && isAdminOrSuper ? 'allocation' : 'rollcall'
+          );
           setDrawerBatchId(batchId);
+        }}
+      />
+
+      {/* Staff / Faculty / First-Run Auth Modal */}
+      <AuthModal
+        isOpen={isAuthModalOpen}
+        superAdminClaimed={superAdminClaimed}
+        facultyDirectory={facultyDirectory}
+        currentUser={currentUser}
+        onClose={() => setIsAuthModalOpen(false)}
+        onAuthenticated={handleAuthenticated}
+        onContinueAsGuest={() => {
+          if (isAuthenticatedEditor) {
+            void handleLogout();
+          }
         }}
       />
     </div>

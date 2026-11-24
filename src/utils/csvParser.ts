@@ -1,15 +1,67 @@
-import {
+import type {
   AttendanceStatus,
   BatchRecord,
   BatchSessionMeta,
   InternshipDay,
   ParsedCohortData,
+  SessionPeriod,
   StudentRecord,
-} from '../types/internship';
+} from '../types/internship.ts';
 
 export const SOURCE_CSV_URL = '/assets/aistudio/B2025-2029_Internship_ATTENDANCE_ddabe17c';
 
-// Embedded copy of the attached CSV used only as an instant offline fallback if fetch fails
+export function compareLex(a: string, b: string): number {
+  const sa = String(a ?? '');
+  const sb = String(b ?? '');
+  if (sa < sb) return -1;
+  if (sa > sb) return 1;
+  return 0;
+}
+
+export function makeSessionKey(dateKey: string, session: SessionPeriod): string {
+  return `${dateKey}::${session}`;
+}
+
+export function normalizeRollNumberKey(rawKey: string): string {
+  const idx = rawKey.indexOf('::');
+  const roll = idx >= 0 ? rawKey.slice(idx + 2) : rawKey;
+  return roll.trim().toUpperCase();
+}
+
+export function migrateAttendanceKeys(
+  rawAttendance: Record<string, Record<string, AttendanceStatus>>,
+  rawMeta: Record<string, Record<string, BatchSessionMeta>>
+): {
+  dailyAttendance: Record<string, Record<string, AttendanceStatus>>;
+  sessionMeta: Record<string, Record<string, BatchSessionMeta>>;
+} {
+  const dailyAttendance: Record<string, Record<string, AttendanceStatus>> = {};
+  const sessionMeta: Record<string, Record<string, BatchSessionMeta>> = {};
+
+  Object.entries(rawAttendance || {}).forEach(([k, val]) => {
+    const sessKey =
+      k.includes('::FN') || k.includes('::AN') ? k : makeSessionKey(k, 'FN');
+    const normalizedMap: Record<string, AttendanceStatus> = {
+      ...(dailyAttendance[sessKey] || {}),
+    };
+    Object.entries(val || {}).forEach(([studentKey, status]) => {
+      const rollKey = normalizeRollNumberKey(studentKey);
+      if (rollKey) {
+        normalizedMap[rollKey] = status;
+      }
+    });
+    dailyAttendance[sessKey] = normalizedMap;
+  });
+
+  Object.entries(rawMeta || {}).forEach(([k, val]) => {
+    const sessKey =
+      k.includes('::FN') || k.includes('::AN') ? k : makeSessionKey(k, 'FN');
+    sessionMeta[sessKey] = val;
+  });
+
+  return { dailyAttendance, sessionMeta };
+}
+
 export const FALLBACK_CSV_TEXT = `,"Fullstack Internship B2025-2029 - II Year
 (24.11.2026 - 12.12.2026)",,,,,,,,
 Organisation,Department,College Internship (IT),Venue,Expert Name,Room Number,Gender,Contact Number,Mail ID,Faculty Incharge (Fullstack)
@@ -36,16 +88,22 @@ Mr.R.Hariharan"
 Smart,IT,69,TF27,Mr. Rohan,706,Male,76710 64603,chrohankumar8504@gmail.com,Dr.R.Poongodi/ IT
 ,Mech,CORE,,,,,,,`;
 
-/**
- * RFC-4180 compliant CSV parser handling quoted multi-line fields and CRLF.
- */
 export function parseRawCsvRows(text: string): string[][] {
+  const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const firstNonEmptyLine =
+    normalized
+      .split('\n')
+      .map((l) => l.trim())
+      .find(Boolean) || '';
+  const delimiter =
+    firstNonEmptyLine.includes('\t') && !firstNonEmptyLine.includes(',')
+      ? '\t'
+      : ',';
+
   const rows: string[][] = [];
   let row: string[] = [];
   let cell = '';
   let inQuotes = false;
-
-  const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
   for (let i = 0; i < normalized.length; i++) {
     const char = normalized[i];
@@ -63,7 +121,7 @@ export function parseRawCsvRows(text: string): string[][] {
     } else {
       if (char === '"') {
         inQuotes = true;
-      } else if (char === ',') {
+      } else if (char === delimiter) {
         row.push(cell.trim());
         cell = '';
       } else if (char === '\n') {
@@ -94,7 +152,8 @@ function splitMultiValue(raw: string): string[] {
   return raw
     .split(/\n|,(?=\s*[A-Za-z0-9])/)
     .map((s) => s.replace(/\s+/g, ' ').trim())
-    .filter(Boolean);
+    .filter(Boolean)
+    .sort(compareLex);
 }
 
 export function parseInternshipCsv(csvText: string): ParsedCohortData {
@@ -112,7 +171,14 @@ export function parseInternshipCsv(csvText: string): ParsedCohortData {
       if (lines[0]) programTitle = lines[0];
       if (lines[1]) dateRange = lines[1].replace(/[()]/g, '');
     }
-    if (rows[i].some((c) => c.toLowerCase() === 'department')) {
+    if (
+      rows[i].some(
+        (c) =>
+          c.toLowerCase() === 'department' ||
+          c.toLowerCase() === 'class' ||
+          c.toLowerCase() === 'class name'
+      )
+    ) {
       headerIdx = i;
       break;
     }
@@ -163,6 +229,8 @@ export function parseInternshipCsv(csvText: string): ParsedCohortData {
     });
   });
 
+  batches.sort((a, b) => compareLex(a.department, b.department));
+
   return {
     programTitle,
     dateRange,
@@ -170,10 +238,226 @@ export function parseInternshipCsv(csvText: string): ParsedCohortData {
   };
 }
 
+function normalizeDeptLookupKey(raw: string): string {
+  return raw.toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+export function inferDepartmentFromText(
+  text: string,
+  batches: BatchRecord[]
+): string | undefined {
+  if (!text) return undefined;
+  const upper = text.toUpperCase();
+  const ordered = [...batches].sort(
+    (a, b) => b.department.length - a.department.length || compareLex(a.department, b.department)
+  );
+  for (const b of ordered) {
+    const escaped = b.department.toUpperCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`(^|[^A-Z0-9])${escaped}([^A-Z0-9]|$)`);
+    if (regex.test(upper)) {
+      return b.department;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Parses a student-level CSV/TSV exported or copied from Google Sheets
+ * (Roll No, Student Name, optional Class Name / Department, optional Email)
+ * and binds each unique student (keyed by rollNumber) to the matching class batch.
+ */
+export function parseStudentRosterCsv(
+  csvText: string,
+  batches: BatchRecord[],
+  fallbackDepartment?: string
+): { students: StudentRecord[]; matchedCount: number } | null {
+  const rows = parseRawCsvRows(csvText);
+  if (rows.length < 2) return null;
+
+  let headerIdx = -1;
+  let rollCol = -1;
+  let nameCol = -1;
+  let classCol = -1;
+  let emailCol = -1;
+
+  for (let i = 0; i < Math.min(rows.length, 8); i++) {
+    const cols = rows[i].map((c) => c.toLowerCase().replace(/[^a-z0-9]/g, ''));
+    const rIdx = cols.findIndex(
+      (c) =>
+        c === 'rollno' ||
+        c === 'rollnumber' ||
+        c === 'roll' ||
+        c === 'regno' ||
+        c === 'registerno' ||
+        c === 'registernumber' ||
+        c === 'regdno' ||
+        c === 'studentid' ||
+        c === 'usn'
+    );
+    const nIdx = cols.findIndex(
+      (c) =>
+        c === 'studentname' ||
+        c === 'name' ||
+        c === 'fullname' ||
+        c === 'candidatename' ||
+        c === 'nameofthestudent' ||
+        c === 'studentsname'
+    );
+    const cIdx = cols.findIndex(
+      (c) =>
+        c === 'class' ||
+        c === 'classname' ||
+        c === 'department' ||
+        c === 'dept' ||
+        c === 'section' ||
+        c === 'batch' ||
+        c === 'classsection' ||
+        c === 'deptsec'
+    );
+    const eIdx = cols.findIndex(
+      (c) => c === 'email' || c === 'mailid' || c === 'mail' || c === 'emailid'
+    );
+
+    if (rIdx >= 0 && nIdx >= 0) {
+      headerIdx = i;
+      rollCol = rIdx;
+      nameCol = nIdx;
+      classCol = cIdx;
+      emailCol = eIdx;
+      break;
+    }
+  }
+
+  if (headerIdx < 0) return null;
+
+  const batchByNormalizedDept = new Map<string, BatchRecord>();
+  batches.forEach((b) => {
+    batchByNormalizedDept.set(b.department.trim().toUpperCase(), b);
+    batchByNormalizedDept.set(normalizeDeptLookupKey(b.department), b);
+  });
+
+  // If CSV has no class column, try detecting department from banner lines above header or fallbackDepartment
+  let resolvedFallbackDept = fallbackDepartment;
+  if (!resolvedFallbackDept && classCol < 0 && headerIdx > 0) {
+    const bannerText = rows
+      .slice(0, headerIdx)
+      .map((r) => r.join(' '))
+      .join(' ');
+    resolvedFallbackDept = inferDepartmentFromText(bannerText, batches);
+  }
+
+  const fallbackBatch = resolvedFallbackDept
+    ? batchByNormalizedDept.get(resolvedFallbackDept.trim().toUpperCase()) ||
+      batchByNormalizedDept.get(normalizeDeptLookupKey(resolvedFallbackDept))
+    : undefined;
+
+  if (classCol < 0 && !fallbackBatch) {
+    return null;
+  }
+
+  const uniqueByRoll = new Map<string, StudentRecord>();
+  let matchedCount = 0;
+
+  rows.slice(headerIdx + 1).forEach((cols) => {
+    const rollNumber = (cols[rollCol] || '').trim().toUpperCase();
+    const studentName = (cols[nameCol] || '').trim();
+    const rawClass = classCol >= 0 ? (cols[classCol] || '').trim() : '';
+    const rawEmail = emailCol >= 0 ? (cols[emailCol] || '').trim() : '';
+
+    if (!rollNumber) return;
+
+    const batch = rawClass
+      ? batchByNormalizedDept.get(rawClass.toUpperCase()) ||
+        batchByNormalizedDept.get(normalizeDeptLookupKey(rawClass))
+      : fallbackBatch;
+    if (!batch) return;
+
+    matchedCount++;
+    uniqueByRoll.set(rollNumber, {
+      id: rollNumber,
+      rollNumber,
+      name: studentName || `${batch.department} · ${rollNumber}`,
+      department: batch.department,
+      batchId: batch.id,
+      email: rawEmail || `${rollNumber.toLowerCase()}@sece.ac.in`,
+    });
+  });
+
+  if (uniqueByRoll.size === 0) return null;
+
+  return {
+    students: deduplicateAndSortStudents(Array.from(uniqueByRoll.values())),
+    matchedCount,
+  };
+}
+
+export interface ExtractedFacultyAccount {
+  username: string;
+  displayName: string;
+  assignedDepartments: string[];
+}
+
+function cleanFacultyDisplayName(rawPart: string): string {
+  const withoutDept = rawPart.replace(/\/\s*[A-Za-z0-9-]+$/i, '').trim();
+  return withoutDept
+    .replace(/\b(Mr|Ms|Mrs|Dr)\.\s*/gi, (_, title: string) => {
+      const normalized = title.charAt(0).toUpperCase() + title.slice(1).toLowerCase();
+      return `${normalized}. `;
+    })
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function facultyNameToUsername(displayName: string): string {
+  const withoutTitle = displayName
+    .replace(/^(Mr|Ms|Mrs|Dr)\.\s*/i, '')
+    .trim();
+  const slug = withoutTitle
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '.')
+    .replace(/^\.+|\.+$/g, '');
+  return slug || 'faculty';
+}
+
+export function extractFacultyAccounts(batches: BatchRecord[]): ExtractedFacultyAccount[] {
+  const map = new Map<string, ExtractedFacultyAccount>();
+
+  batches.forEach((batch) => {
+    batch.facultyIncharge.forEach((entry) => {
+      const parts = entry.split(/\s*&\s*/);
+      parts.forEach((part) => {
+        const displayName = cleanFacultyDisplayName(part);
+        if (!displayName) return;
+        const username = facultyNameToUsername(displayName);
+        const existing = map.get(username);
+        if (existing) {
+          if (!existing.assignedDepartments.includes(batch.department)) {
+            existing.assignedDepartments.push(batch.department);
+          }
+        } else {
+          map.set(username, {
+            username,
+            displayName,
+            assignedDepartments: [batch.department],
+          });
+        }
+      });
+    });
+  });
+
+  const list = Array.from(map.values());
+  list.forEach((item) => {
+    item.assignedDepartments.sort(compareLex);
+  });
+
+  return list.sort(
+    (a, b) => compareLex(a.displayName, b.displayName) || compareLex(a.username, b.username)
+  );
+}
+
 export function generateInternshipDays(): InternshipDay[] {
-  // 24.11.2026 to 12.12.2026 (inclusive)
-  const start = new Date(2026, 10, 24); // Nov 24, 2026
-  const end = new Date(2026, 11, 12);   // Dec 12, 2026
+  const start = new Date(2026, 10, 24);
+  const end = new Date(2026, 11, 12);
   const days: InternshipDay[] = [];
   let sessionCount = 0;
 
@@ -200,30 +484,14 @@ export function generateInternshipDays(): InternshipDay[] {
   return days;
 }
 
-const FIRST_NAMES = [
-  'Aarav', 'Abhinav', 'Adhithya', 'Aishwarya', 'Akash', 'Ananya', 'Arjun', 'Aravind',
-  'Ashwin', 'Bala', 'Bhavana', 'Charan', 'Deepak', 'Devika', 'Dhanush', 'Divya',
-  'Gokul', 'Harini', 'Harish', 'Ishwarya', 'Janani', 'Jayasurya', 'Kailash', 'Kamalesh',
-  'Karthikeyan', 'Kavya', 'Keerthana', 'Kiran', 'Kishore', 'Kowsalya', 'Lakshmi', 'Lavanya',
-  'Madhan', 'Mahesh', 'Meenakshi', 'Mithun', 'Monika', 'Nandhini', 'Naveen', 'Neha',
-  'Nikhil', 'Nithya', 'Pavithra', 'Pranav', 'Praveen', 'Priya', 'Rahul', 'Rajesh',
-  'Rakshitha', 'Ramya', 'Ranjith', 'Reshma', 'Rithika', 'Rohan', 'Rohini', 'Sabarish',
-  'Sadhana', 'Sanjay', 'Santhosh', 'Saranya', 'Sathish', 'Shalini', 'Shanthi', 'Shiva',
-  'Shreya', 'Siddharth', 'Sindhu', 'Sneha', 'Sowmya', 'Srinidhi', 'Subash', 'Sudharsan',
-  'Surya', 'Swathi', 'Tamilselvan', 'Tharun', 'Vaishnavi', 'Varun', 'Vignesh', 'Vijay',
-  'Vikram', 'Vinoth', 'Vishal', 'Yamini', 'Yogesh', 'Yuvaraj',
-];
-
-const LAST_INITIALS = ['K', 'S', 'R', 'M', 'P', 'V', 'N', 'A', 'B', 'G', 'T', 'D', 'C', 'J'];
-
-function getDeptPrefix(dept: string): string {
-  const clean = dept.toUpperCase();
-  if (clean.startsWith('AIDS-A')) return '25AD1';
-  if (clean.startsWith('AIDS-B')) return '25AD2';
-  if (clean.startsWith('AIDS-C')) return '25AD3';
-  if (clean.startsWith('AIDS-D')) return '25AD4';
-  if (clean.startsWith('AIML-A')) return '25AM1';
-  if (clean.startsWith('AIML-B')) return '25AM2';
+function getBaseDeptPrefix(dept: string): string {
+  const clean = dept.trim().toUpperCase();
+  if (clean === 'AIDS-A') return '25AD1';
+  if (clean === 'AIDS-B') return '25AD2';
+  if (clean === 'AIDS-C') return '25AD3';
+  if (clean === 'AIDS-D') return '25AD4';
+  if (clean === 'AIML-A') return '25AM1';
+  if (clean === 'AIML-B') return '25AM2';
   if (clean === 'CCE') return '25CC0';
   if (clean === 'CSBS') return '25CB0';
   if (clean === 'CSE-A') return '25CS1';
@@ -236,7 +504,9 @@ function getDeptPrefix(dept: string): string {
   if (clean === 'ECE-C') return '25EC3';
   if (clean === 'EEE') return '25EE0';
   if (clean === 'IT') return '25IT0';
-  return '25ME0';
+  if (clean === 'MECH') return '25ME0';
+  const alnum = clean.replace(/[^A-Z0-9]/g, '');
+  return `25${alnum.slice(0, 4) || 'CL'}`;
 }
 
 function hashSeed(str: string): number {
@@ -248,28 +518,60 @@ function hashSeed(str: string): number {
   return Math.abs(h);
 }
 
+export function deduplicateAndSortStudents(students: StudentRecord[]): StudentRecord[] {
+  const uniqueByRoll = new Map<string, StudentRecord>();
+  students.forEach((s) => {
+    const rollNumber = (s.rollNumber || s.id).trim().toUpperCase();
+    if (!rollNumber) return;
+    uniqueByRoll.set(rollNumber, {
+      ...s,
+      id: rollNumber,
+      rollNumber,
+    });
+  });
+  return Array.from(uniqueByRoll.values()).sort((a, b) =>
+    compareLex(a.rollNumber, b.rollNumber)
+  );
+}
+
 export function generateStudentsForBatches(batches: BatchRecord[]): StudentRecord[] {
-  const students: StudentRecord[] = [];
-  batches.forEach((batch) => {
-    const prefix = getDeptPrefix(batch.department);
+  const orderedBatches = [...batches].sort((a, b) =>
+    compareLex(a.department, b.department)
+  );
+  const usedPrefixes = new Set<string>();
+  const uniqueStudents = new Map<string, StudentRecord>();
+
+  orderedBatches.forEach((batch) => {
+    let prefix = getBaseDeptPrefix(batch.department);
+    if (usedPrefixes.has(prefix)) {
+      let suffixIdx = 2;
+      while (usedPrefixes.has(`${prefix}_${suffixIdx}`)) {
+        suffixIdx++;
+      }
+      prefix = `${prefix}_${suffixIdx}`;
+    }
+    usedPrefixes.add(prefix);
+
+    const width = batch.studentCount >= 100 ? 3 : 2;
     for (let i = 1; i <= batch.studentCount; i++) {
-      const rollSuffix = String(i).padStart(2, '0');
+      const rollSuffix = String(i).padStart(width, '0');
       const rollNumber = `${prefix}${rollSuffix}`;
-      const seed = hashSeed(`${batch.department}-${i}`);
-      const firstName = FIRST_NAMES[seed % FIRST_NAMES.length];
-      const lastInitial = LAST_INITIALS[(seed >> 4) % LAST_INITIALS.length];
-      const name = `${firstName} ${lastInitial}.`;
-      students.push({
-        id: `${batch.id}::${rollNumber}`,
+      if (uniqueStudents.has(rollNumber)) continue;
+
+      uniqueStudents.set(rollNumber, {
+        id: rollNumber,
         rollNumber,
-        name,
+        name: `${batch.department} Student ${rollSuffix}`,
         department: batch.department,
         batchId: batch.id,
         email: `${rollNumber.toLowerCase()}@sece.ac.in`,
       });
     }
   });
-  return students;
+
+  return Array.from(uniqueStudents.values()).sort((a, b) =>
+    compareLex(a.rollNumber, b.rollNumber)
+  );
 }
 
 export function generateInitialAttendanceState(
@@ -283,60 +585,96 @@ export function generateInitialAttendanceState(
   const dailyAttendance: Record<string, Record<string, AttendanceStatus>> = {};
   const sessionMeta: Record<string, Record<string, BatchSessionMeta>> = {};
 
-  // Populate Day 01 (2026-11-24) as active opening day so the dashboard immediately displays live metrics
   const firstDay = days.find((d) => !d.isSunday);
   if (firstDay) {
-    const dayMap: Record<string, AttendanceStatus> = {};
-    const metaMap: Record<string, BatchSessionMeta> = {};
+    const fnKey = makeSessionKey(firstDay.dateKey, 'FN');
+    const anKey = makeSessionKey(firstDay.dateKey, 'AN');
+
+    const fnMap: Record<string, AttendanceStatus> = {};
+    const anMap: Record<string, AttendanceStatus> = {};
+    const fnMeta: Record<string, BatchSessionMeta> = {};
+    const anMeta: Record<string, BatchSessionMeta> = {};
 
     batches.forEach((batch, bIdx) => {
       if (batch.trackType === 'CORE') {
-        metaMap[batch.id] = {
+        fnMeta[batch.id] = {
           status: 'core',
           updatedAt: '09:00 AM',
+          note: 'Core Mechanical track monitored separately',
+        };
+        anMeta[batch.id] = {
+          status: 'core',
+          updatedAt: '01:30 PM',
           note: 'Core Mechanical track monitored separately',
         };
         return;
       }
 
-      // Leave 2 unassigned batches pending roll-call so user can immediately see pending vs marked workflow
-      const isPendingBatch = !batch.venue && (batch.department === 'ECE-C' || batch.department === 'EEE');
-      if (isPendingBatch) {
-        metaMap[batch.id] = {
-          status: 'pending',
-          updatedAt: 'Awaiting roll call',
-        };
-        const batchStudents = students.filter((s) => s.batchId === batch.id);
+      const batchStudents = students.filter((s) => s.batchId === batch.id);
+
+      // FN (Forenoon) initial roll call
+      const isFnPending =
+        !batch.venue && (batch.department === 'ECE-C' || batch.department === 'EEE');
+      if (isFnPending) {
+        fnMeta[batch.id] = { status: 'pending', updatedAt: 'Awaiting FN roll call' };
         batchStudents.forEach((s) => {
-          dayMap[s.id] = 'unmarked';
+          fnMap[s.id] = 'unmarked';
         });
-        return;
+      } else {
+        const isInSession = bIdx % 5 === 2;
+        fnMeta[batch.id] = {
+          status: isInSession ? 'in-session' : 'completed',
+          updatedAt: isInSession ? '10:05 AM' : '09:45 AM',
+        };
+        batchStudents.forEach((s, sIdx) => {
+          const seed = hashSeed(`${firstDay.dateKey}-FN-${s.rollNumber}`);
+          const roll = seed % 100;
+          if (roll < 4) {
+            fnMap[s.id] = 'absent';
+          } else if (roll < 7) {
+            fnMap[s.id] = 'late';
+          } else if (roll === 11 && sIdx % 4 === 0) {
+            fnMap[s.id] = 'od';
+          } else {
+            fnMap[s.id] = 'present';
+          }
+        });
       }
 
-      const isInSession = bIdx % 4 === 1;
-      metaMap[batch.id] = {
-        status: isInSession ? 'in-session' : 'completed',
-        updatedAt: isInSession ? '09:42 AM' : '09:18 AM',
-      };
-
-      const batchStudents = students.filter((s) => s.batchId === batch.id);
-      batchStudents.forEach((s, sIdx) => {
-        const seed = hashSeed(`${firstDay.dateKey}-${s.id}`);
-        const roll = seed % 100;
-        if (roll < 4) {
-          dayMap[s.id] = 'absent';
-        } else if (roll < 7) {
-          dayMap[s.id] = 'late';
-        } else if (roll === 8 && sIdx % 5 === 0) {
-          dayMap[s.id] = 'od';
-        } else {
-          dayMap[s.id] = 'present';
-        }
-      });
+      // AN (Afternoon) initial roll call
+      const isAnPending =
+        !batch.venue || batch.department === 'CYS' || batch.department === 'AIML-A';
+      if (isAnPending) {
+        anMeta[batch.id] = { status: 'pending', updatedAt: 'Awaiting AN roll call' };
+        batchStudents.forEach((s) => {
+          anMap[s.id] = 'unmarked';
+        });
+      } else {
+        const isAnInSession = bIdx % 3 === 1;
+        anMeta[batch.id] = {
+          status: isAnInSession ? 'in-session' : 'completed',
+          updatedAt: isAnInSession ? '01:45 PM' : '02:15 PM',
+        };
+        batchStudents.forEach((s, sIdx) => {
+          const seed = hashSeed(`${firstDay.dateKey}-AN-${s.rollNumber}`);
+          const roll = seed % 100;
+          if (roll < 5) {
+            anMap[s.id] = 'absent';
+          } else if (roll < 8) {
+            anMap[s.id] = 'late';
+          } else if (roll === 15 && sIdx % 5 === 0) {
+            anMap[s.id] = 'od';
+          } else {
+            anMap[s.id] = 'present';
+          }
+        });
+      }
     });
 
-    dailyAttendance[firstDay.dateKey] = dayMap;
-    sessionMeta[firstDay.dateKey] = metaMap;
+    dailyAttendance[fnKey] = fnMap;
+    dailyAttendance[anKey] = anMap;
+    sessionMeta[fnKey] = fnMeta;
+    sessionMeta[anKey] = anMeta;
   }
 
   return { dailyAttendance, sessionMeta };
@@ -354,20 +692,26 @@ export function buildBatchSummaryCsv(
   dateKey: string,
   batches: BatchRecord[],
   students: StudentRecord[],
-  dayAttendance: Record<string, AttendanceStatus>
+  fnAttendance: Record<string, AttendanceStatus>,
+  anAttendance: Record<string, AttendanceStatus>,
+  activeSession: SessionPeriod
 ): string {
   const headers = [
     'Date',
+    'Active Session',
     'Organisation',
-    'Department',
+    'Class Name',
     'Track',
     'Total Enrolled',
-    'Present',
-    'Late',
-    'On-Duty',
-    'Absent',
-    'Unmarked',
-    'Attendance %',
+    'FN Attended',
+    'FN %',
+    'AN Attended',
+    'AN %',
+    `${activeSession} Present`,
+    `${activeSession} Late`,
+    `${activeSession} On-Duty`,
+    `${activeSession} Absent`,
+    `${activeSession} Unmarked`,
     'Venue',
     'Room Number',
     'Expert Name',
@@ -376,8 +720,16 @@ export function buildBatchSummaryCsv(
     'Faculty Incharge',
   ];
 
-  const rows = batches.map((batch) => {
+  const sortedBatches = [...batches].sort((a, b) =>
+    compareLex(a.department, b.department)
+  );
+
+  const rows = sortedBatches.map((batch) => {
     const batchStudents = students.filter((s) => s.batchId === batch.id);
+    const activeMap = activeSession === 'FN' ? fnAttendance : anAttendance;
+
+    let fnAttended = 0;
+    let anAttended = 0;
     let present = 0;
     let late = 0;
     let od = 0;
@@ -385,7 +737,12 @@ export function buildBatchSummaryCsv(
     let unmarked = 0;
 
     batchStudents.forEach((s) => {
-      const st = dayAttendance[s.id] || 'unmarked';
+      const fnSt = fnAttendance[s.id] || 'unmarked';
+      const anSt = anAttendance[s.id] || 'unmarked';
+      if (fnSt === 'present' || fnSt === 'late' || fnSt === 'od') fnAttended++;
+      if (anSt === 'present' || anSt === 'late' || anSt === 'od') anAttended++;
+
+      const st = activeMap[s.id] || 'unmarked';
       if (st === 'present') present++;
       else if (st === 'late') late++;
       else if (st === 'od') od++;
@@ -393,21 +750,27 @@ export function buildBatchSummaryCsv(
       else unmarked++;
     });
 
-    const attended = present + late + od;
-    const pct = batch.studentCount > 0 ? ((attended / batch.studentCount) * 100).toFixed(1) : 'N/A';
+    const fnPct =
+      batch.studentCount > 0 ? `${((fnAttended / batch.studentCount) * 100).toFixed(1)}%` : 'CORE';
+    const anPct =
+      batch.studentCount > 0 ? `${((anAttended / batch.studentCount) * 100).toFixed(1)}%` : 'CORE';
 
     return [
       dateKey,
+      activeSession,
       batch.organisation,
       batch.department,
       batch.trackType,
       batch.trackType === 'CORE' ? 'CORE' : batch.studentCount,
+      batch.trackType === 'CORE' ? 'CORE' : fnAttended,
+      fnPct,
+      batch.trackType === 'CORE' ? 'CORE' : anAttended,
+      anPct,
       present,
       late,
       od,
       absent,
       unmarked,
-      pct === 'N/A' ? 'CORE' : `${pct}%`,
       batch.venue || 'Pending',
       batch.roomNumber || '-',
       batch.expertName || 'Unassigned',
@@ -426,24 +789,29 @@ export function buildStudentRollCallCsv(
   dateKey: string,
   batches: BatchRecord[],
   students: StudentRecord[],
-  dayAttendance: Record<string, AttendanceStatus>
+  fnAttendance: Record<string, AttendanceStatus>,
+  anAttendance: Record<string, AttendanceStatus>
 ): string {
   const batchById = new Map(batches.map((b) => [b.id, b]));
   const headers = [
     'Date',
     'Roll Number',
     'Student Name',
-    'Department',
+    'Class Name',
     'Organisation',
     'Venue',
     'Room',
-    'Status',
+    'FN Status',
+    'AN Status',
     'Email',
   ];
 
-  const rows = students.map((s) => {
+  const sortedStudents = deduplicateAndSortStudents(students);
+
+  const rows = sortedStudents.map((s) => {
     const batch = batchById.get(s.batchId);
-    const st = dayAttendance[s.id] || 'unmarked';
+    const fnSt = fnAttendance[s.id] || 'unmarked';
+    const anSt = anAttendance[s.id] || 'unmarked';
     return [
       dateKey,
       s.rollNumber,
@@ -452,7 +820,8 @@ export function buildStudentRollCallCsv(
       batch?.organisation || '-',
       batch?.venue || '-',
       batch?.roomNumber || '-',
-      st.toUpperCase(),
+      fnSt.toUpperCase(),
+      anSt.toUpperCase(),
       s.email,
     ]
       .map(escapeCsvCell)

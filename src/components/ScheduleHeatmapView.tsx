@@ -4,15 +4,20 @@ import {
   AttendanceStatus,
   BatchRecord,
   InternshipDay,
+  SessionPeriod,
   StudentRecord,
 } from '../types/internship';
+import { compareLex, makeSessionKey } from '../utils/csvParser';
 
 interface ScheduleHeatmapViewProps {
   batches: BatchRecord[];
   students: StudentRecord[];
   days: InternshipDay[];
   selectedDateKey: string;
+  activeSession: SessionPeriod;
+  onChangeSession: (session: SessionPeriod) => void;
   dailyAttendance: Record<string, Record<string, AttendanceStatus>>;
+  canPopulateWeekLogs: boolean;
   onJumpToDayBatch: (dateKey: string, batchId: string) => void;
   onSelectDay: (dateKey: string) => void;
   onPopulateWeekPreview: () => void;
@@ -23,7 +28,10 @@ export const ScheduleHeatmapView: React.FC<ScheduleHeatmapViewProps> = ({
   students,
   days,
   selectedDateKey,
+  activeSession,
+  onChangeSession,
   dailyAttendance,
+  canPopulateWeekLogs,
   onJumpToDayBatch,
   onSelectDay,
   onPopulateWeekPreview,
@@ -41,7 +49,10 @@ export const ScheduleHeatmapView: React.FC<ScheduleHeatmapViewProps> = ({
   }, [students]);
 
   const itBatches = useMemo(
-    () => batches.filter((b) => b.trackType === 'IT'),
+    () =>
+      batches
+        .filter((b) => b.trackType === 'IT')
+        .sort((a, b) => compareLex(a.department, b.department)),
     [batches]
   );
 
@@ -63,21 +74,46 @@ export const ScheduleHeatmapView: React.FC<ScheduleHeatmapViewProps> = ({
       <div className="bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 rounded-xl p-5 flex flex-wrap items-center justify-between gap-4">
         <div>
           <h2 className="text-lg font-semibold text-slate-900 dark:text-white tracking-tight">
-            17-Day Internship Attendance Matrix (24.11.2026 – 12.12.2026)
+            17-Day {activeSession} Attendance Matrix (24.11.2026 – 12.12.2026)
           </h2>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-            Click any day column header to switch active date, or click a department cell to inspect that session&apos;s roll call.
+            Switch between Forenoon (FN) and Afternoon (AN) sessions, or click any cell to inspect that batch&apos;s roll call.
           </p>
         </div>
 
-        <button
-          type="button"
-          onClick={onPopulateWeekPreview}
-          className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0"
-        >
-          <Sparkles className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
-          Generate Week 1 Sample Logs
-        </button>
+        <div className="flex flex-wrap items-center gap-2.5">
+          <div
+            className="inline-flex items-center p-1 bg-slate-100 dark:bg-slate-800 rounded-lg"
+            role="group"
+            aria-label="Session period"
+          >
+            {(['FN', 'AN'] as SessionPeriod[]).map((sess) => (
+              <button
+                key={sess}
+                type="button"
+                onClick={() => onChangeSession(sess)}
+                className={`px-3 py-1.5 text-xs font-mono font-semibold rounded-md transition-colors whitespace-nowrap ${
+                  activeSession === sess
+                    ? 'bg-white dark:bg-[#111827] text-slate-900 dark:text-white shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                }`}
+              >
+                {sess === 'FN' ? 'FN · Forenoon' : 'AN · Afternoon'}
+              </button>
+            ))}
+          </div>
+
+          {canPopulateWeekLogs && (
+            <button
+              type="button"
+              onClick={onPopulateWeekPreview}
+              className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0"
+            >
+              <Sparkles className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+              Generate Week 1 FN &amp; AN Logs
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
@@ -130,7 +166,8 @@ export const ScheduleHeatmapView: React.FC<ScheduleHeatmapViewProps> = ({
                       </div>
                     </td>
                     {workingDays.map((day) => {
-                      const dayMap = dailyAttendance[day.dateKey] || {};
+                      const dayMap =
+                        dailyAttendance[makeSessionKey(day.dateKey, activeSession)] || {};
                       let marked = 0;
                       let attended = 0;
                       batchStudents.forEach((s) => {
@@ -152,8 +189,10 @@ export const ScheduleHeatmapView: React.FC<ScheduleHeatmapViewProps> = ({
                           <button
                             type="button"
                             onClick={() => onJumpToDayBatch(day.dateKey, batch.id)}
-                            title={`${batch.department} on ${day.label}: ${
-                              pct === null ? 'No roll call recorded' : `${pct}% (${attended}/${batch.studentCount})`
+                            title={`${batch.department} (${activeSession}) on ${day.label}: ${
+                              pct === null
+                                ? 'No roll call recorded'
+                                : `${pct}% (${attended}/${batch.studentCount})`
                             }`}
                             className={`w-full py-1.5 px-1 rounded-md border font-mono tabular-nums text-[11px] font-medium transition-transform hover:scale-[1.03] ${getCellStyle(
                               pct
@@ -174,7 +213,9 @@ export const ScheduleHeatmapView: React.FC<ScheduleHeatmapViewProps> = ({
         <div className="px-4 py-3 border-t border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-4 text-xs text-slate-500 dark:text-slate-400">
           <div className="inline-flex items-center gap-2">
             <CalendarDays className="w-3.5 h-3.5" />
-            <span>Sundays (Nov 29, Dec 06) excluded as non-session days.</span>
+            <span>
+              Viewing {activeSession === 'FN' ? 'Forenoon (FN)' : 'Afternoon (AN)'} session · Sundays excluded.
+            </span>
           </div>
           <div className="flex flex-wrap items-center gap-4 font-mono text-[11px]">
             <span className="text-emerald-700 dark:text-emerald-400">≥90% Optimal</span>

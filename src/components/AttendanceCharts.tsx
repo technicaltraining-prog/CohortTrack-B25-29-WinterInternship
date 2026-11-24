@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { AttendanceStatus, BatchRecord, StudentRecord } from '../types/internship';
+import { compareLex } from '../utils/csvParser';
 
 interface AttendanceChartsProps {
   batches: BatchRecord[];
@@ -43,6 +44,7 @@ export const AttendanceCharts: React.FC<AttendanceChartsProps> = ({
   const deptData: DeptBarDatum[] = useMemo(() => {
     return batches
       .filter((b) => b.trackType === 'IT')
+      .sort((a, b) => compareLex(a.department, b.department))
       .map((batch) => {
         const list = studentsByBatch.get(batch.id) || [];
         let present = 0;
@@ -82,7 +84,7 @@ export const AttendanceCharts: React.FC<AttendanceChartsProps> = ({
       map.set(org, entry);
     });
 
-    return Array.from(map.values()).sort((a, b) => b.total - a.total);
+    return Array.from(map.values()).sort((a, b) => compareLex(a.org, b.org));
   }, [deptData]);
 
   const hoveredDatum = useMemo(

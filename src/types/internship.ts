@@ -1,8 +1,27 @@
 export type TrackType = 'IT' | 'CORE';
 
+export type SessionPeriod = 'FN' | 'AN';
+
 export type AttendanceStatus = 'present' | 'absent' | 'late' | 'od' | 'unmarked';
 
 export type BatchSessionStatus = 'completed' | 'in-session' | 'pending' | 'core';
+
+export type UserRole = 'guest' | 'faculty' | 'admin' | 'superadmin';
+
+export interface AuthUser {
+  username: string;
+  displayName: string;
+  role: UserRole;
+  assignedDepartments: string[];
+}
+
+export interface AccountSummary {
+  username: string;
+  displayName: string;
+  role: Exclude<UserRole, 'guest'>;
+  assignedDepartments: string[];
+  hasPassword: boolean;
+}
 
 export interface BatchRecord {
   id: string;
@@ -50,4 +69,9 @@ export interface ParsedCohortData {
   batches: BatchRecord[];
 }
 
-export type DashboardView = 'overview' | 'students' | 'directory' | 'schedule';
+export type DashboardView =
+  | 'overview'
+  | 'students'
+  | 'directory'
+  | 'schedule'
+  | 'access';

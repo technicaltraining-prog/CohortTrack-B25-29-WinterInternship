@@ -15,17 +15,24 @@ import {
   AttendanceStatus,
   BatchRecord,
   BatchSessionStatus,
+  SessionPeriod,
   StudentRecord,
 } from '../types/internship';
+import { compareLex } from '../utils/csvParser';
 
 interface BatchDetailDrawerProps {
   batch: BatchRecord | null;
   students: StudentRecord[];
   dayLabel: string;
   dateKey: string;
+  activeSession: SessionPeriod;
+  onChangeSession: (session: SessionPeriod) => void;
   dayAttendance: Record<string, AttendanceStatus>;
+  pairedDayAttendance: Record<string, AttendanceStatus>;
   sessionStatus: BatchSessionStatus;
   initialTab?: 'rollcall' | 'allocation';
+  canMarkAttendance: boolean;
+  canEditAllocation: boolean;
   onClose: () => void;
   onSetStudentStatus: (studentId: string, status: AttendanceStatus) => void;
   onBulkSetBatchStatus: (batchId: string, status: AttendanceStatus, onlyUnmarked?: boolean) => void;
@@ -45,9 +52,14 @@ export const BatchDetailDrawer: React.FC<BatchDetailDrawerProps> = ({
   students,
   dayLabel,
   dateKey,
+  activeSession,
+  onChangeSession,
   dayAttendance,
+  pairedDayAttendance,
   sessionStatus,
   initialTab = 'rollcall',
+  canMarkAttendance,
+  canEditAllocation,
   onClose,
   onSetStudentStatus,
   onBulkSetBatchStatus,
@@ -71,8 +83,10 @@ export const BatchDetailDrawer: React.FC<BatchDetailDrawerProps> = ({
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
 
   useEffect(() => {
-    setActiveTab(initialTab);
-  }, [initialTab, batch?.id]);
+    setActiveTab(
+      initialTab === 'allocation' && !canEditAllocation ? 'rollcall' : initialTab
+    );
+  }, [initialTab, batch?.id, canEditAllocation]);
 
   useEffect(() => {
     if (!batch) return;
@@ -100,7 +114,9 @@ export const BatchDetailDrawer: React.FC<BatchDetailDrawerProps> = ({
 
   const batchStudents = useMemo(() => {
     if (!batch) return [];
-    return students.filter((s) => s.batchId === batch.id);
+    return students
+      .filter((s) => s.batchId === batch.id)
+      .sort((a, b) => compareLex(a.rollNumber, b.rollNumber));
   }, [batch, students]);
 
   const counts = useMemo(() => {
@@ -270,31 +286,58 @@ export const BatchDetailDrawer: React.FC<BatchDetailDrawerProps> = ({
           </div>
         </div>
 
-        {/* Drawer Tabs + Session State Control */}
+        {/* Drawer Tabs + FN/AN Switcher + Session State Control */}
         <div className="px-6 py-3 border-b border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-3">
-          <div className="inline-flex items-center p-1 bg-slate-100 dark:bg-slate-800 rounded-lg">
-            <button
-              type="button"
-              onClick={() => setActiveTab('rollcall')}
-              className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
-                activeTab === 'rollcall'
-                  ? 'bg-white dark:bg-[#111827] text-slate-900 dark:text-white shadow-xs'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-              }`}
-            >
-              Student Roll Call
-            </button>
-            <button
-              type="button"
-              onClick={() => setActiveTab('allocation')}
-              className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
-                activeTab === 'allocation'
-                  ? 'bg-white dark:bg-[#111827] text-slate-900 dark:text-white shadow-xs'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-              }`}
-            >
-              Edit Allocation
-            </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="inline-flex items-center p-1 bg-slate-100 dark:bg-slate-800 rounded-lg">
+              <button
+                type="button"
+                onClick={() => setActiveTab('rollcall')}
+                className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                  activeTab === 'rollcall'
+                    ? 'bg-white dark:bg-[#111827] text-slate-900 dark:text-white shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                }`}
+              >
+                Student Roll Call
+              </button>
+              {canEditAllocation && (
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('allocation')}
+                  className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                    activeTab === 'allocation'
+                      ? 'bg-white dark:bg-[#111827] text-slate-900 dark:text-white shadow-xs'
+                      : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                  }`}
+                >
+                  Edit Allocation
+                </button>
+              )}
+            </div>
+
+            {batch.trackType === 'IT' && (
+              <div
+                className="inline-flex items-center p-1 bg-slate-100 dark:bg-slate-800 rounded-lg"
+                role="group"
+                aria-label="Session period"
+              >
+                {(['FN', 'AN'] as SessionPeriod[]).map((sess) => (
+                  <button
+                    key={sess}
+                    type="button"
+                    onClick={() => onChangeSession(sess)}
+                    className={`px-2.5 py-1.5 text-xs font-mono font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                      activeSession === sess
+                        ? 'bg-blue-600 text-white shadow-xs'
+                        : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                    }`}
+                  >
+                    {sess}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
           {batch.trackType === 'IT' && (
@@ -303,15 +346,16 @@ export const BatchDetailDrawer: React.FC<BatchDetailDrawerProps> = ({
                 htmlFor="drawer-session-status"
                 className="text-xs text-slate-500 dark:text-slate-400"
               >
-                Session:
+                {activeSession} Status:
               </label>
               <select
                 id="drawer-session-status"
                 value={sessionStatus}
+                disabled={!canMarkAttendance}
                 onChange={(e) =>
                   onSetSessionStatus(batch.id, e.target.value as BatchSessionStatus)
                 }
-                className="text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                className="text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-60"
               >
                 <option value="completed">Completed</option>
                 <option value="in-session">In Session</option>
@@ -334,13 +378,15 @@ export const BatchDetailDrawer: React.FC<BatchDetailDrawerProps> = ({
                   rather than the IT Fullstack track. Use Edit Allocation if you want to assign
                   a room or faculty coordinator.
                 </p>
-                <button
-                  type="button"
-                  onClick={() => setActiveTab('allocation')}
-                  className="px-4 py-2 text-xs font-medium rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition-colors"
-                >
-                  Edit Allocation Details
-                </button>
+                {canEditAllocation && (
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('allocation')}
+                    className="px-4 py-2 text-xs font-medium rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition-colors"
+                  >
+                    Edit Allocation Details
+                  </button>
+                )}
               </div>
             </div>
           ) : (
@@ -369,22 +415,28 @@ export const BatchDetailDrawer: React.FC<BatchDetailDrawerProps> = ({
                   </span>
                 </div>
 
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => onBulkSetBatchStatus(batch.id, 'present', false)}
-                    className="px-2.5 py-1.5 text-xs font-medium rounded-md border border-emerald-200 dark:border-emerald-800/70 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 transition-colors whitespace-nowrap shrink-0"
-                  >
-                    Mark All Present
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => onBulkSetBatchStatus(batch.id, 'unmarked', false)}
-                    className="px-2.5 py-1.5 text-xs font-medium rounded-md border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0"
-                  >
-                    Reset Day
-                  </button>
-                </div>
+                {canMarkAttendance ? (
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => onBulkSetBatchStatus(batch.id, 'present', false)}
+                      className="px-2.5 py-1.5 text-xs font-medium rounded-md border border-emerald-200 dark:border-emerald-800/70 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 transition-colors whitespace-nowrap shrink-0"
+                    >
+                      Mark All Present
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onBulkSetBatchStatus(batch.id, 'unmarked', false)}
+                      className="px-2.5 py-1.5 text-xs font-medium rounded-md border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0"
+                    >
+                      Reset Day
+                    </button>
+                  </div>
+                ) : (
+                  <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                    View-only · Sign in as {batch.department} Faculty or Admin to edit
+                  </span>
+                )}
               </div>
 
               {/* Search & Status Filter */}
@@ -425,6 +477,8 @@ export const BatchDetailDrawer: React.FC<BatchDetailDrawerProps> = ({
                 ) : (
                   filteredStudents.map((student) => {
                     const current = dayAttendance[student.id] || 'unmarked';
+                    const paired = pairedDayAttendance[student.id] || 'unmarked';
+                    const pairedLabel = activeSession === 'FN' ? 'AN' : 'FN';
                     return (
                       <div
                         key={student.id}
@@ -439,7 +493,7 @@ export const BatchDetailDrawer: React.FC<BatchDetailDrawerProps> = ({
                               {student.name}
                             </div>
                             <div className="text-[11px] font-mono text-slate-400 dark:text-slate-500 truncate">
-                              {student.email}
+                              {student.email} · {pairedLabel}: {paired.toUpperCase()}
                             </div>
                           </div>
                         </div>
@@ -466,6 +520,7 @@ export const BatchDetailDrawer: React.FC<BatchDetailDrawerProps> = ({
                               <button
                                 key={opt.value}
                                 type="button"
+                                disabled={!canMarkAttendance}
                                 onClick={() =>
                                   onSetStudentStatus(
                                     student.id,
@@ -476,7 +531,7 @@ export const BatchDetailDrawer: React.FC<BatchDetailDrawerProps> = ({
                                   active
                                     ? activeCls
                                     : 'border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'
-                                }`}
+                                } ${!canMarkAttendance ? 'opacity-75 cursor-default hover:bg-transparent' : ''}`}
                               >
                                 {opt.label}
                               </button>

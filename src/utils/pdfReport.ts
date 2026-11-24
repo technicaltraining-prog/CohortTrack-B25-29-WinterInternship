@@ -1,6 +1,6 @@
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
-import { BatchRecord } from '../types/internship';
+import { BatchRecord, SessionPeriod } from '../types/internship';
 
 export interface PdfBatchRow {
   batch: BatchRecord;
@@ -11,6 +11,8 @@ export interface PdfBatchRow {
   unmarked: number;
   attended: number;
   rate: number;
+  fnRate: number;
+  anRate: number;
 }
 
 export interface PdfSummaryTotals {
@@ -22,16 +24,19 @@ export interface PdfSummaryTotals {
   unmarked: number;
   attended: number;
   rate: number;
+  fnRate: number;
+  anRate: number;
 }
 
 export function downloadDailyAttendancePdf(params: {
   programTitle: string;
   dayLabel: string;
   dateKey: string;
+  session: SessionPeriod;
   rows: PdfBatchRow[];
   totals: PdfSummaryTotals;
 }): void {
-  const { programTitle, dayLabel, dateKey, rows, totals } = params;
+  const { programTitle, dayLabel, dateKey, session, rows, totals } = params;
 
   const doc = new jsPDF({
     orientation: 'portrait',
@@ -51,18 +56,22 @@ export function downloadDailyAttendancePdf(params: {
   doc.setTextColor(255, 255, 255);
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(14);
-  doc.text('Daily Attendance Summary Report', marginX, 12);
+  doc.text(`Daily Attendance Summary Report (${session})`, marginX, 12);
 
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(9);
-  doc.setTextColor(203, 213, 225); // slate-300
-  doc.text(programTitle, marginX, 18.5);
+  doc.setTextColor(203, 213, 225);
+  doc.text(
+    `${programTitle}  ·  FN ${totals.fnRate.toFixed(1)}%  |  AN ${totals.anRate.toFixed(1)}%`,
+    marginX,
+    18.5
+  );
 
   const generatedStamp = new Date().toLocaleString([], {
     dateStyle: 'medium',
     timeStyle: 'short',
   });
-  doc.text(`${dayLabel} (${dateKey})`, pageWidth - marginX, 12, {
+  doc.text(`${dayLabel} (${dateKey}) · ${session}`, pageWidth - marginX, 12, {
     align: 'right',
   });
   doc.setFontSize(8);
@@ -88,35 +97,35 @@ export function downloadDailyAttendancePdf(params: {
     {
       label: 'TOTAL ENROLLED',
       value: String(totals.enrolled),
-      sub: `${totals.rate.toFixed(1)}% attended`,
+      sub: `${session}: ${totals.rate.toFixed(1)}%`,
       color: [15, 23, 42],
     },
     {
-      label: 'PRESENT',
+      label: `${session} PRESENT`,
       value: String(totals.present),
       sub: pctOf(totals.present),
       color: [21, 128, 61],
     },
     {
-      label: 'LATE',
+      label: `${session} LATE`,
       value: String(totals.late),
       sub: pctOf(totals.late),
       color: [180, 83, 9],
     },
     {
-      label: 'ON-DUTY (OD)',
+      label: `${session} OD`,
       value: String(totals.od),
       sub: pctOf(totals.od),
       color: [29, 78, 216],
     },
     {
-      label: 'ABSENT',
+      label: `${session} ABSENT`,
       value: String(totals.absent),
       sub: pctOf(totals.absent),
       color: [190, 18, 60],
     },
     {
-      label: 'UNMARKED',
+      label: `${session} UNMARKED`,
       value: String(totals.unmarked),
       sub: pctOf(totals.unmarked),
       color: [71, 85, 105],
@@ -149,7 +158,11 @@ export function downloadDailyAttendancePdf(params: {
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(10);
   doc.setTextColor(15, 23, 42);
-  doc.text('Batch-by-Batch Attendance Breakdown', marginX, 60);
+  doc.text(
+    `Batch-by-Batch Breakdown (${session} Session Counts + FN / AN Rates)`,
+    marginX,
+    60
+  );
 
   const tableBody = rows.map((row) => {
     const isCore = row.batch.trackType === 'CORE';
@@ -167,8 +180,8 @@ export function downloadDailyAttendancePdf(params: {
       isCore ? '—' : String(row.late),
       isCore ? '—' : String(row.od),
       isCore ? '—' : String(row.absent),
-      isCore ? '—' : String(row.unmarked),
-      isCore ? '—' : `${row.rate.toFixed(1)}%`,
+      isCore ? '—' : `${row.fnRate.toFixed(0)}%`,
+      isCore ? '—' : `${row.anRate.toFixed(0)}%`,
     ];
   });
 
@@ -187,8 +200,8 @@ export function downloadDailyAttendancePdf(params: {
         'Late',
         'OD',
         'Absent',
-        'Unmarked',
-        'Attended %',
+        'FN %',
+        'AN %',
       ],
     ],
     body: tableBody,
@@ -202,8 +215,8 @@ export function downloadDailyAttendancePdf(params: {
         String(totals.late),
         String(totals.od),
         String(totals.absent),
-        String(totals.unmarked),
-        `${totals.rate.toFixed(1)}%`,
+        `${totals.fnRate.toFixed(1)}%`,
+        `${totals.anRate.toFixed(1)}%`,
       ],
     ],
     theme: 'grid',
@@ -235,13 +248,13 @@ export function downloadDailyAttendancePdf(params: {
       0: { fontStyle: 'bold', cellWidth: 18 },
       1: { cellWidth: 28 },
       2: { cellWidth: 28 },
-      3: { halign: 'right', cellWidth: 15 },
+      3: { halign: 'right', cellWidth: 16 },
       4: { halign: 'right', textColor: [21, 128, 61], cellWidth: 15 },
-      5: { halign: 'right', textColor: [180, 83, 9], cellWidth: 12 },
+      5: { halign: 'right', textColor: [180, 83, 9], cellWidth: 13 },
       6: { halign: 'right', textColor: [29, 78, 216], cellWidth: 12 },
-      7: { halign: 'right', textColor: [190, 18, 60], cellWidth: 14 },
-      8: { halign: 'right', textColor: [100, 116, 139], cellWidth: 18 },
-      9: { halign: 'right', fontStyle: 'bold', cellWidth: 22 },
+      7: { halign: 'right', textColor: [190, 18, 60], cellWidth: 15 },
+      8: { halign: 'right', fontStyle: 'bold', cellWidth: 18 },
+      9: { halign: 'right', fontStyle: 'bold', cellWidth: 19 },
     },
     didDrawPage: () => {
       const pageCount = doc.getNumberOfPages();
@@ -250,7 +263,7 @@ export function downloadDailyAttendancePdf(params: {
       doc.setFontSize(7.5);
       doc.setTextColor(148, 163, 184);
       doc.text(
-        `CohortTrack — ${programTitle}`,
+        `CohortTrack — ${programTitle} (${session})`,
         marginX,
         pageHeight - 8
       );
@@ -263,5 +276,5 @@ export function downloadDailyAttendancePdf(params: {
     },
   });
 
-  doc.save(`B2025-2029_Daily_Attendance_Report_${dateKey}.pdf`);
+  doc.save(`B2025-2029_Daily_Attendance_Report_${dateKey}_${session}.pdf`);
 }
